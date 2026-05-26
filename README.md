@@ -1,5 +1,5 @@
 <!-- file: README.md -->
-<!-- version: 3.0.0 -->
+<!-- version: 3.1.0 -->
 <!-- guid: c68a62ce-72d1-45cc-a6c8-d3dfc41d0e34 -->
 <!-- last-edited: 2026-05-25 -->
 
@@ -154,6 +154,11 @@ WHERE is_live;
 This means the project does not need a separate Raft library or mDNS trust
 model. CockroachDB already provides consensus for the SQL lease and rollout
 state.
+
+Use a secure CockroachDB SQL URL in `CROACH_ROLLOUT_DATABASE_URL`, for example
+with `sslmode=require` or the certificate parameters your cluster already uses.
+Do not put the URL in the repository; place it in `/etc/cockroach-rollout-agent.env`
+or another host-local secret source.
 
 mDNS can be added later as an optional discovery hint, but it should not be the
 trust root. A LAN broadcast protocol is too easy to abuse unless every message

@@ -11,7 +11,9 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use postgres::{Client, NoTls};
+use native_tls::TlsConnector;
+use postgres::Client;
+use postgres_native_tls::MakeTlsConnector;
 use regex::Regex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -757,7 +759,10 @@ fn db_client(cli: &Cli) -> Result<Client, AppError> {
     let database_url = cli.database_url.as_deref().ok_or_else(|| {
         AppError::Message("--database-url or CROACH_ROLLOUT_DATABASE_URL is required".to_string())
     })?;
-    Ok(Client::connect(database_url, NoTls)?)
+    let tls = TlsConnector::builder()
+        .build()
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    Ok(Client::connect(database_url, MakeTlsConnector::new(tls))?)
 }
 
 fn ensure_schema(cli: &Cli, client: &mut Client) -> Result<(), AppError> {
