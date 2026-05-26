@@ -1,5 +1,5 @@
 <!-- file: README.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 2.3.0 -->
 <!-- guid: c68a62ce-72d1-45cc-a6c8-d3dfc41d0e34 -->
 <!-- last-edited: 2026-05-25 -->
 
@@ -14,12 +14,20 @@ target system, or a secret manager.
 
 ## Current Scope
 
+- Discovers production CockroachDB versions from the upstream GitHub tags API.
+- Refuses alpha, beta, RC, and other prerelease builds.
+- Plans upgrades release-line by release-line using CockroachDB `vYY.R` major
+  lines.
+- Fetches release notes and blocks by default if warning patterns are found.
 - Downloads CockroachDB Linux `amd64` and `arm64` tarballs from the official
   binary endpoint.
-- Provides a guarded local installer that stops a systemd service, backs up the
-  current binary, replaces it, and starts the service again.
+- Writes a JSON manifest containing artifact URLs, sizes, SHA-256 digests, and
+  release-note scan results.
+- Provides a guarded local installer that validates the manifest, stops a
+  systemd service, backs up the current binary, replaces it, and starts the
+  service again.
 - Writes append-only audit events with timestamps and action details.
-- Documents the intended quorum design without committing private topology.
+- Provides a polling daemon mode that can consume a manifest URL or file.
 
 CockroachDB does not publish official ARMv6 Linux artifacts through the normal
 binary endpoint. The implementation targets `arm64`, which is the supported
@@ -28,10 +36,13 @@ Linux ARM build.
 ## Commands
 
 ```bash
-cargo run -- fetch
+cargo run -- plan --current-version v25.2.3
+cargo run -- prepare --current-version v25.2.3
+cargo run -- prepare --current-version v25.2.3 --allow-breaking-warnings
 cargo run -- self-check
-cargo run -- install dist/cockroach-latest.linux-amd64.tgz
-cargo run -- daemon
+cargo run -- install --manifest dist/manifest.json --dry-run
+cargo run -- finalize --target-version v25.4.3 --dry-run
+cargo run -- daemon --manifest-url https://example.invalid/manifest.json --dry-run
 ```
 
 ## Runtime Configuration
@@ -39,11 +50,21 @@ cargo run -- daemon
 | Variable | Default |
 | --- | --- |
 | `CROACH_ROLLOUT_BASE_URL` | `https://binaries.cockroachdb.com` |
-| `CROACH_ROLLOUT_VERSION` | `latest` |
+| `CROACH_ROLLOUT_GITHUB_API_URL` | `https://api.github.com/repos/cockroachdb/cockroach/tags?per_page=100` |
+| `CROACH_ROLLOUT_RELEASE_NOTES_BASE_URL` | `https://www.cockroachlabs.com/docs/releases` |
 | `CROACH_ROLLOUT_ARTIFACTS_DIR` | `dist` |
 | `CROACH_ROLLOUT_SERVICE` | `cockroachdb.service` |
 | `CROACH_ROLLOUT_BINARY_PATH` | `/usr/local/bin/cockroach` |
 | `CROACH_ROLLOUT_AUDIT_LOG` | `/var/log/cockroach-rollout-agent/audit.log` |
+| `CROACH_ROLLOUT_CURRENT_VERSION` | unset |
+| `CROACH_ROLLOUT_TARGET_VERSION` | unset |
+| `CROACH_ROLLOUT_MANIFEST_URL` | unset |
+| `CROACH_ROLLOUT_MANIFEST_FILE` | unset |
+| `CROACH_ROLLOUT_PSK` | unset |
+
+When `CROACH_ROLLOUT_PSK` is set, HTTP downloads use it as a bearer token. This
+supports a simple PSK-over-TLS deployment for manifest hosting. Do not commit
+this value.
 
 ## Rollout Design
 
@@ -57,9 +78,26 @@ The preferred production design is pull-based:
    unauthenticated LAN discovery.
 4. The coordinator announces the target version. Agents pull the artifact over
    mutually authenticated TLS or an equivalent authenticated channel.
-5. Each agent validates the signed metadata, confirms the artifact digest,
-   stops only its local CockroachDB systemd service, atomically replaces the
-   binary, restarts the service, and records audit events.
+5. Each agent validates the manifest, confirms the artifact digest, confirms
+   the manifest was prepared for the node's current binary version, verifies
+   release-note warning approval, stops only its local CockroachDB systemd
+   service, atomically replaces the binary, restarts the service, and records
+   audit events.
+6. After every node has rejoined the cluster on the new binary, patch upgrades
+   are complete. Major-line upgrades must be finalized, either automatically by
+   CockroachDB or manually with `finalize`.
+
+## Upgrade Sequencing
+
+CockroachDB major versions are `vYY.R` release lines. `plan` emits every
+release line between the current version and the requested target. `prepare`
+downloads only the next step in that plan. After rolling that manifest to all
+nodes and finalizing when required, run `prepare` again from the new current
+version to create the next step.
+
+The tool deliberately excludes prerelease versions because CockroachDB warns
+that clusters upgraded to alpha binaries or manually built master binaries
+cannot later be upgraded to a production release.
 
 mDNS can be added later as an optional discovery hint, but it should not be the
 trust root. A LAN broadcast protocol is too easy to abuse unless every message
@@ -95,3 +133,12 @@ Before publishing, verify:
   committed;
 - examples use placeholders only;
 - logs, artifacts, backups, and local state are ignored by Git.
+
+## Remaining Production Hardening
+
+The tool is now runnable, but two production hardening items should be added
+before unattended fleet rollout:
+
+- manifest signatures, preferably Sigstore or minisign, so digest metadata has
+  an authenticity guarantee beyond TLS;
+- CockroachDB SQL lease integration for leader election and rollout quorum.

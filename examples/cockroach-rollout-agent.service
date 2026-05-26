@@ -1,5 +1,5 @@
 # file: examples/cockroach-rollout-agent.service
-# version: 1.0.0
+# version: 1.1.0
 # guid: eaf842e1-7611-4539-848e-73b84ed31c7e
 
 [Unit]
@@ -11,6 +11,7 @@ Wants=network-online.target
 Type=simple
 User=cockroach
 Group=cockroach
+Environment=CROACH_ROLLOUT_MANIFEST_FILE=/var/lib/cockroach-rollout-agent/manifest.json
 ExecStart=/usr/local/bin/cockroach-rollout-agent daemon
 Restart=on-failure
 RestartSec=10s

@@ -1,49 +1,231 @@
 // file: src/main.rs
-// version: 1.0.0
+// version: 2.1.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 
-use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use clap::{Parser, Subcommand};
+use regex::Regex;
+use semver::Version;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 const DEFAULT_BASE_URL: &str = "https://binaries.cockroachdb.com";
-const DEFAULT_VERSION: &str = "latest";
+const DEFAULT_GITHUB_API_URL: &str =
+    "https://api.github.com/repos/cockroachdb/cockroach/tags?per_page=100";
+const DEFAULT_RELEASE_NOTES_BASE_URL: &str = "https://www.cockroachlabs.com/docs/releases";
+const DEFAULT_ARTIFACTS_DIR: &str = "dist";
+const DEFAULT_SERVICE_NAME: &str = "cockroachdb.service";
+const DEFAULT_BINARY_PATH: &str = "/usr/local/bin/cockroach";
+const DEFAULT_AUDIT_LOG: &str = "/var/log/cockroach-rollout-agent/audit.log";
+const DEFAULT_MANIFEST_PATH: &str = "dist/manifest.json";
+const DEFAULT_DAEMON_INTERVAL_SECONDS: u64 = 300;
 const SUPPORTED_ARCHES: &[&str] = &["amd64", "arm64"];
+const BREAKING_CHANGE_PATTERNS: &[&str] = &[
+    "backward incompatible",
+    "backwards incompatible",
+    "breaking change",
+    "breaking changes",
+    "incompatible change",
+    "manual upgrade",
+    "manual action",
+    "cannot downgrade",
+    "deprecat",
+    "removed",
+    "no longer supported",
+    "requires",
+    "migration",
+];
 
-#[derive(Debug)]
-struct Config {
+#[derive(Debug, Parser)]
+#[command(author, version, about)]
+struct Cli {
+    #[arg(long, env = "CROACH_ROLLOUT_BASE_URL", default_value = DEFAULT_BASE_URL)]
     base_url: String,
-    version: String,
+
+    #[arg(
+        long,
+        env = "CROACH_ROLLOUT_GITHUB_API_URL",
+        default_value = DEFAULT_GITHUB_API_URL
+    )]
+    github_api_url: String,
+
+    #[arg(
+        long,
+        env = "CROACH_ROLLOUT_RELEASE_NOTES_BASE_URL",
+        default_value = DEFAULT_RELEASE_NOTES_BASE_URL
+    )]
+    release_notes_base_url: String,
+
+    #[arg(
+        long,
+        env = "CROACH_ROLLOUT_ARTIFACTS_DIR",
+        default_value = DEFAULT_ARTIFACTS_DIR
+    )]
     artifacts_dir: PathBuf,
+
+    #[arg(long, env = "CROACH_ROLLOUT_SERVICE", default_value = DEFAULT_SERVICE_NAME)]
     service_name: String,
+
+    #[arg(
+        long,
+        env = "CROACH_ROLLOUT_BINARY_PATH",
+        default_value = DEFAULT_BINARY_PATH
+    )]
     binary_path: PathBuf,
+
+    #[arg(long, env = "CROACH_ROLLOUT_AUDIT_LOG", default_value = DEFAULT_AUDIT_LOG)]
     audit_log: PathBuf,
+
+    #[command(subcommand)]
+    command: Commands,
 }
 
-impl Config {
-    fn from_env() -> Self {
-        Self {
-            base_url: env::var("CROACH_ROLLOUT_BASE_URL")
-                .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
-            version: env::var("CROACH_ROLLOUT_VERSION")
-                .unwrap_or_else(|_| DEFAULT_VERSION.to_string()),
-            artifacts_dir: env::var_os("CROACH_ROLLOUT_ARTIFACTS_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("dist")),
-            service_name: env::var("CROACH_ROLLOUT_SERVICE")
-                .unwrap_or_else(|_| "cockroachdb.service".to_string()),
-            binary_path: env::var_os("CROACH_ROLLOUT_BINARY_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/usr/local/bin/cockroach")),
-            audit_log: env::var_os("CROACH_ROLLOUT_AUDIT_LOG")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/var/log/cockroach-rollout-agent/audit.log")),
-        }
-    }
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Download artifacts, scan notes, and write a rollout manifest.
+    Prepare {
+        /// Current CockroachDB version. Defaults to running the configured binary.
+        #[arg(long, env = "CROACH_ROLLOUT_CURRENT_VERSION")]
+        current_version: Option<String>,
+
+        /// Target version. Defaults to the latest GitHub release.
+        #[arg(long, env = "CROACH_ROLLOUT_TARGET_VERSION")]
+        target_version: Option<String>,
+
+        /// Permit release-note warning matches without failing.
+        #[arg(long)]
+        allow_breaking_warnings: bool,
+    },
+
+    /// Print a JSON upgrade plan without downloading artifacts.
+    Plan {
+        /// Current CockroachDB version. Defaults to running the configured binary.
+        #[arg(long, env = "CROACH_ROLLOUT_CURRENT_VERSION")]
+        current_version: Option<String>,
+
+        /// Target version. Defaults to the latest GitHub release.
+        #[arg(long, env = "CROACH_ROLLOUT_TARGET_VERSION")]
+        target_version: Option<String>,
+    },
+
+    /// Install an artifact after validating it against a manifest.
+    Install {
+        #[arg(long, default_value = DEFAULT_MANIFEST_PATH)]
+        manifest: PathBuf,
+
+        #[arg(long)]
+        arch: Option<String>,
+
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Poll a manifest URL or file and apply safe updates.
+    Daemon {
+        #[arg(long, env = "CROACH_ROLLOUT_MANIFEST_URL")]
+        manifest_url: Option<String>,
+
+        #[arg(long, env = "CROACH_ROLLOUT_MANIFEST_FILE")]
+        manifest_file: Option<PathBuf>,
+
+        #[arg(long, default_value_t = DEFAULT_DAEMON_INTERVAL_SECONDS)]
+        interval_seconds: u64,
+
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Finalize a major-version upgrade after every node is on the new binary.
+    Finalize {
+        /// Target CockroachDB version. Uses the major line, for example v25.4.3 finalizes 25.4.
+        #[arg(long, env = "CROACH_ROLLOUT_TARGET_VERSION")]
+        target_version: String,
+
+        /// Print the SQL command without executing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Validate local commands and permissions.
+    SelfCheck,
+}
+
+#[derive(Debug, Error)]
+enum AppError {
+    #[error("{0}")]
+    Message(String),
+
+    #[error(transparent)]
+    Io(#[from] io::Error),
+
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+
+    #[error(transparent)]
+    Semver(#[from] semver::Error),
+
+    #[error(transparent)]
+    Regex(#[from] regex::Error),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubRelease {
+    #[serde(alias = "name")]
+    tag_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UpgradePlan {
+    current_version: Version,
+    requested_target_version: Version,
+    next_version: Version,
+    latest_version: Version,
+    release_notes_url: String,
+    release_note_warnings: Vec<String>,
+    upgrade_steps: Vec<UpgradeStep>,
+    release_line_by_release_line: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpgradeStep {
+    from_version: Version,
+    to_version: Version,
+    release_line: String,
+    release_notes_url: String,
+    requires_finalization: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RolloutManifest {
+    schema_version: u32,
+    created_unix: u64,
+    current_version: Version,
+    target_version: Version,
+    release_notes_url: String,
+    release_note_warnings: Vec<String>,
+    release_note_warnings_approved: bool,
+    artifacts: Vec<Artifact>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Artifact {
+    os: String,
+    arch: String,
+    url: String,
+    path: String,
+    sha256: String,
+    bytes: u64,
 }
 
 fn main() -> ExitCode {
@@ -56,237 +238,788 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
-    let mut args = env::args().skip(1);
-    let command = args.next().unwrap_or_else(|| "help".to_string());
-    let config = Config::from_env();
+fn run() -> Result<(), AppError> {
+    let cli = Cli::parse();
 
-    match command.as_str() {
-        "fetch" => fetch_command(&config),
-        "install" => {
-            let artifact = args
-                .next()
-                .ok_or_else(|| "install requires a tarball path".to_string())?;
-            install_command(&config, Path::new(&artifact))
-        }
-        "daemon" => daemon_command(&config),
-        "self-check" => self_check_command(&config),
-        "help" | "--help" | "-h" => {
-            print_help();
+    match &cli.command {
+        Commands::Prepare {
+            current_version,
+            target_version,
+            allow_breaking_warnings,
+        } => prepare_command(
+            &cli,
+            current_version.as_deref(),
+            target_version.as_deref(),
+            *allow_breaking_warnings,
+        ),
+        Commands::Plan {
+            current_version,
+            target_version,
+        } => {
+            let plan =
+                build_upgrade_plan(&cli, current_version.as_deref(), target_version.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
             Ok(())
         }
-        _ => Err(format!("unknown command: {command}")),
+        Commands::Install {
+            manifest,
+            arch,
+            dry_run,
+        } => install_command(&cli, manifest, arch.as_deref(), *dry_run),
+        Commands::Daemon {
+            manifest_url,
+            manifest_file,
+            interval_seconds,
+            dry_run,
+        } => daemon_command(
+            &cli,
+            manifest_url.as_deref(),
+            manifest_file.as_deref(),
+            *interval_seconds,
+            *dry_run,
+        ),
+        Commands::Finalize {
+            target_version,
+            dry_run,
+        } => finalize_command(&cli, target_version, *dry_run),
+        Commands::SelfCheck => self_check_command(&cli),
     }
 }
 
-fn fetch_command(config: &Config) -> Result<(), String> {
-    fs::create_dir_all(&config.artifacts_dir).map_err(display_error)?;
-
-    for arch in SUPPORTED_ARCHES {
-        let url = cockroach_url(&config.base_url, &config.version, arch);
-        let destination = config
-            .artifacts_dir
-            .join(format!("cockroach-{}.linux-{}.tgz", config.version, arch));
-
+fn prepare_command(
+    cli: &Cli,
+    current_version: Option<&str>,
+    target_version: Option<&str>,
+    allow_breaking_warnings: bool,
+) -> Result<(), AppError> {
+    let plan = build_upgrade_plan(cli, current_version, target_version)?;
+    if !plan.release_note_warnings.is_empty() && !allow_breaking_warnings {
         audit(
-            config,
-            "fetch_start",
+            cli,
+            "prepare_blocked_release_notes",
+            &format!(
+                "target={} warning_count={}",
+                plan.next_version,
+                plan.release_note_warnings.len()
+            ),
+        )?;
+        return Err(AppError::Message(format!(
+            "release notes contain warning patterns; rerun with --allow-breaking-warnings after review: {}",
+            plan.release_notes_url
+        )));
+    }
+
+    fs::create_dir_all(&cli.artifacts_dir)?;
+    let mut artifacts = Vec::new();
+    for arch in SUPPORTED_ARCHES {
+        let url = cockroach_url(&cli.base_url, &plan.next_version, arch);
+        let destination = cli.artifacts_dir.join(format!(
+            "cockroach-{}.linux-{}.tgz",
+            plan.next_version, arch
+        ));
+        audit(
+            cli,
+            "download_start",
             &format!(
                 "arch={arch} url={url} destination={}",
                 destination.display()
             ),
         )?;
-        run_command(
-            "curl",
-            [
-                OsStr::new("--fail"),
-                OsStr::new("--location"),
-                OsStr::new("--show-error"),
-                OsStr::new("--output"),
-                destination.as_os_str(),
-                OsStr::new(&url),
-            ],
-        )?;
+        download_to_file(&url, &destination)?;
+        let (sha256, bytes) = sha256_file(&destination)?;
+        artifacts.push(Artifact {
+            os: "linux".to_string(),
+            arch: (*arch).to_string(),
+            url,
+            path: destination.to_string_lossy().into_owned(),
+            sha256,
+            bytes,
+        });
         audit(
-            config,
-            "fetch_complete",
+            cli,
+            "download_complete",
             &format!("arch={arch} destination={}", destination.display()),
         )?;
+    }
+
+    let manifest = RolloutManifest {
+        schema_version: 1,
+        created_unix: unix_time()?,
+        current_version: plan.current_version,
+        target_version: plan.next_version,
+        release_notes_url: plan.release_notes_url,
+        release_note_warnings: plan.release_note_warnings,
+        release_note_warnings_approved: allow_breaking_warnings,
+        artifacts,
+    };
+
+    let manifest_path = cli.artifacts_dir.join("manifest.json");
+    write_json_file(&manifest_path, &manifest)?;
+    println!("{}", serde_json::to_string_pretty(&manifest)?);
+    audit(
+        cli,
+        "manifest_written",
+        &format!("manifest={}", manifest_path.display()),
+    )?;
+    Ok(())
+}
+
+fn build_upgrade_plan(
+    cli: &Cli,
+    current_version: Option<&str>,
+    target_version: Option<&str>,
+) -> Result<UpgradePlan, AppError> {
+    let current = match current_version {
+        Some(version) => parse_cockroach_version(version)?,
+        None => installed_cockroach_version(&cli.binary_path)?,
+    };
+    let available_versions = available_cockroach_versions(&cli.github_api_url)?;
+    let latest = available_versions
+        .iter()
+        .max()
+        .cloned()
+        .ok_or_else(|| AppError::Message("no CockroachDB releases discovered".to_string()))?;
+    let target = match target_version {
+        Some(version) => parse_cockroach_version(version)?,
+        None => latest.clone(),
+    };
+
+    let upgrade_steps = build_upgrade_steps(
+        &current,
+        &target,
+        &available_versions,
+        &cli.release_notes_base_url,
+    )?;
+    let next_step = upgrade_steps
+        .first()
+        .cloned()
+        .ok_or_else(|| AppError::Message("no upgrade step is required".to_string()))?;
+
+    let release_notes = fetch_text(&next_step.release_notes_url)?;
+    let warnings = scan_release_notes(&release_notes)?;
+
+    Ok(UpgradePlan {
+        current_version: current,
+        requested_target_version: target,
+        next_version: next_step.to_version.clone(),
+        latest_version: latest,
+        release_notes_url: next_step.release_notes_url.clone(),
+        release_note_warnings: warnings,
+        upgrade_steps,
+        release_line_by_release_line: true,
+    })
+}
+
+fn install_command(
+    cli: &Cli,
+    manifest_path: &Path,
+    arch: Option<&str>,
+    dry_run: bool,
+) -> Result<(), AppError> {
+    let manifest: RolloutManifest = read_json_file(manifest_path)?;
+    let current = installed_cockroach_version(&cli.binary_path)?;
+    validate_manifest_current_version(&current, &manifest)?;
+
+    if !manifest.release_note_warnings.is_empty() && !manifest.release_note_warnings_approved {
+        return Err(AppError::Message(
+            "manifest contains release-note warnings; generate an approved manifest after review"
+                .to_string(),
+        ));
+    }
+
+    let local_arch = arch.map(str::to_string).unwrap_or_else(normalized_arch);
+    let artifact = manifest
+        .artifacts
+        .iter()
+        .find(|candidate| candidate.os == "linux" && candidate.arch == local_arch)
+        .ok_or_else(|| AppError::Message(format!("manifest has no linux/{local_arch} artifact")))?;
+    let artifact_path = Path::new(&artifact.path);
+    verify_artifact(artifact_path, artifact)?;
+
+    audit(
+        cli,
+        "install_validated",
+        &format!(
+            "target={} arch={} artifact={}",
+            manifest.target_version,
+            local_arch,
+            artifact_path.display()
+        ),
+    )?;
+
+    if dry_run {
+        println!(
+            "dry run: would install {} from {}",
+            manifest.target_version,
+            artifact_path.display()
+        );
+        return Ok(());
+    }
+
+    install_artifact(cli, artifact_path)
+}
+
+fn daemon_command(
+    cli: &Cli,
+    manifest_url: Option<&str>,
+    manifest_file: Option<&Path>,
+    interval_seconds: u64,
+    dry_run: bool,
+) -> Result<(), AppError> {
+    if manifest_url.is_none() && manifest_file.is_none() {
+        return Err(AppError::Message(
+            "daemon requires --manifest-url or --manifest-file".to_string(),
+        ));
+    }
+
+    audit(cli, "daemon_start", "polling manifest source")?;
+    loop {
+        let result = poll_and_install_manifest(cli, manifest_url, manifest_file, dry_run);
+        if let Err(error) = result {
+            audit(cli, "daemon_poll_failed", &error.to_string())?;
+            eprintln!("daemon poll failed: {error}");
+        }
+        thread::sleep(Duration::from_secs(interval_seconds));
+    }
+}
+
+fn poll_and_install_manifest(
+    cli: &Cli,
+    manifest_url: Option<&str>,
+    manifest_file: Option<&Path>,
+    dry_run: bool,
+) -> Result<(), AppError> {
+    let manifest_path = tempfile::Builder::new()
+        .prefix("cockroach-rollout-manifest-")
+        .suffix(".json")
+        .tempfile()?;
+
+    if let Some(url) = manifest_url {
+        download_to_file(url, manifest_path.path())?;
+    } else if let Some(path) = manifest_file {
+        fs::copy(path, manifest_path.path())?;
+    }
+
+    install_command(cli, manifest_path.path(), None, dry_run)
+}
+
+fn finalize_command(cli: &Cli, target_version: &str, dry_run: bool) -> Result<(), AppError> {
+    let version = parse_cockroach_version(target_version)?;
+    reject_prerelease(&version)?;
+    let cluster_version = major_line_string(&version);
+    let sql = format!("SET CLUSTER SETTING version = '{cluster_version}';");
+
+    audit(
+        cli,
+        "finalize_requested",
+        &format!("target={} cluster_version={cluster_version}", version),
+    )?;
+
+    if dry_run {
+        println!("dry run: {} sql -e \"{sql}\"", cli.binary_path.display());
+        return Ok(());
+    }
+
+    let status = Command::new(&cli.binary_path)
+        .arg("sql")
+        .arg("-e")
+        .arg(&sql)
+        .stdin(Stdio::null())
+        .status()?;
+    if !status.success() {
+        return Err(AppError::Message(format!(
+            "finalization SQL exited with status {status}"
+        )));
+    }
+
+    audit(
+        cli,
+        "finalize_complete",
+        &format!("cluster_version={cluster_version}"),
+    )?;
+    Ok(())
+}
+
+fn self_check_command(cli: &Cli) -> Result<(), AppError> {
+    audit(
+        cli,
+        "self_check_start",
+        "validating local permissions and commands",
+    )?;
+    require_command("tar")?;
+    require_command("systemctl")?;
+
+    if !cli.binary_path.exists() {
+        return Err(AppError::Message(format!(
+            "binary path does not exist: {}",
+            cli.binary_path.display()
+        )));
+    }
+
+    let parent = cli.binary_path.parent().ok_or_else(|| {
+        AppError::Message(format!(
+            "binary path has no parent: {}",
+            cli.binary_path.display()
+        ))
+    })?;
+
+    if !parent.is_dir() {
+        return Err(AppError::Message(format!(
+            "binary parent is not a directory: {}",
+            parent.display()
+        )));
+    }
+
+    installed_cockroach_version(&cli.binary_path)?;
+    audit(cli, "self_check_complete", "local validation completed")?;
+    Ok(())
+}
+
+fn available_cockroach_versions(github_api_url: &str) -> Result<Vec<Version>, AppError> {
+    let releases_url = github_tags_url(github_api_url);
+    let client = reqwest::blocking::Client::new();
+    let mut releases = Vec::new();
+    for page in 1..=10 {
+        let page_url = paginated_url(&releases_url, page);
+        let page_releases: Vec<GitHubRelease> = client
+            .get(page_url)
+            .header(reqwest::header::USER_AGENT, "cockroach-rollout-agent")
+            .send()?
+            .error_for_status()?
+            .json()?;
+        let page_len = page_releases.len();
+        releases.extend(page_releases);
+        if page_len < 100 {
+            break;
+        }
+    }
+
+    let mut versions = releases
+        .iter()
+        .filter_map(|release| parse_cockroach_version(&release.tag_name).ok())
+        .filter(|version| version.pre.is_empty())
+        .collect::<Vec<_>>();
+    versions.sort();
+    versions.dedup();
+    Ok(versions)
+}
+
+fn github_tags_url(github_api_url: &str) -> String {
+    let base = github_api_url
+        .trim_end_matches('/')
+        .replace("/releases/latest", "/tags")
+        .replace("/releases", "/tags")
+        .trim_end_matches("/latest")
+        .to_string();
+    if base.contains('?') {
+        format!("{base}&per_page=100")
+    } else {
+        format!("{base}?per_page=100")
+    }
+}
+
+fn paginated_url(base: &str, page: u16) -> String {
+    if base.contains("page=") {
+        base.to_string()
+    } else if base.contains('?') {
+        format!("{base}&page={page}")
+    } else {
+        format!("{base}?page={page}")
+    }
+}
+
+fn installed_cockroach_version(binary_path: &Path) -> Result<Version, AppError> {
+    let output = Command::new(binary_path)
+        .arg("version")
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(AppError::Message(format!(
+            "{} version exited with status {}",
+            binary_path.display(),
+            output.status
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_cockroach_version(&stdout)
+}
+
+fn parse_cockroach_version(input: &str) -> Result<Version, AppError> {
+    let regex = Regex::new(r"v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)")?;
+    let captures = regex.captures(input).ok_or_else(|| {
+        AppError::Message(format!("could not parse CockroachDB version: {input}"))
+    })?;
+    Ok(Version::parse(&captures[1])?)
+}
+
+fn reject_prerelease(version: &Version) -> Result<(), AppError> {
+    if version.pre.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Message(format!(
+            "pre-production CockroachDB releases are refused: v{version}"
+        )))
+    }
+}
+
+fn build_upgrade_steps(
+    current: &Version,
+    requested_target: &Version,
+    available_versions: &[Version],
+    release_notes_base_url: &str,
+) -> Result<Vec<UpgradeStep>, AppError> {
+    reject_prerelease(current)?;
+    reject_prerelease(requested_target)?;
+
+    if requested_target < current {
+        return Err(AppError::Message(format!(
+            "downgrades are not supported: current={current} target={requested_target}"
+        )));
+    }
+
+    if current == requested_target {
+        return Ok(Vec::new());
+    }
+
+    let current_line = major_line(current);
+    let target_line = major_line(requested_target);
+    if current_line == target_line {
+        return Ok(vec![UpgradeStep {
+            from_version: current.clone(),
+            to_version: requested_target.clone(),
+            release_line: major_line_string(requested_target),
+            release_notes_url: release_notes_url(release_notes_base_url, requested_target),
+            requires_finalization: false,
+        }]);
+    }
+
+    let mut lines = available_versions
+        .iter()
+        .map(major_line)
+        .filter(|line| *line > current_line && *line <= target_line)
+        .collect::<Vec<_>>();
+    lines.sort();
+    lines.dedup();
+
+    if !lines.contains(&target_line) {
+        return Err(AppError::Message(format!(
+            "target release line {} was not found in upstream production releases",
+            major_line_string(requested_target)
+        )));
+    }
+
+    let mut steps = Vec::new();
+    let mut from_version = current.clone();
+    for line in lines {
+        let to_version = if line == target_line {
+            requested_target.clone()
+        } else {
+            latest_version_for_line(line, available_versions)?
+        };
+        steps.push(UpgradeStep {
+            from_version: from_version.clone(),
+            to_version: to_version.clone(),
+            release_line: major_line_string(&to_version),
+            release_notes_url: release_notes_url(release_notes_base_url, &to_version),
+            requires_finalization: true,
+        });
+        from_version = to_version;
+    }
+
+    Ok(steps)
+}
+
+fn latest_version_for_line(
+    line: (u64, u64),
+    available_versions: &[Version],
+) -> Result<Version, AppError> {
+    available_versions
+        .iter()
+        .filter(|version| major_line(version) == line)
+        .max()
+        .cloned()
+        .ok_or_else(|| {
+            AppError::Message(format!(
+                "no upstream production release found for {}.{}",
+                line.0, line.1
+            ))
+        })
+}
+
+fn validate_manifest_current_version(
+    current: &Version,
+    manifest: &RolloutManifest,
+) -> Result<(), AppError> {
+    reject_prerelease(current)?;
+    reject_prerelease(&manifest.current_version)?;
+    reject_prerelease(&manifest.target_version)?;
+
+    if manifest.target_version < manifest.current_version {
+        return Err(AppError::Message(format!(
+            "manifest describes a downgrade: current={} target={}",
+            manifest.current_version, manifest.target_version
+        )));
+    }
+
+    if current != &manifest.current_version {
+        return Err(AppError::Message(format!(
+            "manifest was prepared for current={} but local binary is current={current}; finish and finalize prior steps first",
+            manifest.current_version
+        )));
     }
 
     Ok(())
 }
 
-fn install_command(config: &Config, artifact: &Path) -> Result<(), String> {
-    if !artifact.is_file() {
-        return Err(format!("artifact does not exist: {}", artifact.display()));
+fn major_line(version: &Version) -> (u64, u64) {
+    (version.major, version.minor)
+}
+
+fn major_line_string(version: &Version) -> String {
+    format!("{}.{}", version.major, version.minor)
+}
+
+fn release_notes_url(base_url: &str, version: &Version) -> String {
+    format!(
+        "{}/v{}.{}",
+        base_url.trim_end_matches('/'),
+        version.major,
+        version.minor
+    )
+}
+
+fn scan_release_notes(notes: &str) -> Result<Vec<String>, AppError> {
+    let mut warnings = Vec::new();
+    let lower_notes = notes.to_lowercase();
+    for pattern in BREAKING_CHANGE_PATTERNS {
+        if lower_notes.contains(pattern) {
+            warnings.push((*pattern).to_string());
+        }
+    }
+    warnings.sort();
+    warnings.dedup();
+    Ok(warnings)
+}
+
+fn cockroach_url(base_url: &str, version: &Version, arch: &str) -> String {
+    format!(
+        "{}/cockroach-v{}.linux-{}.tgz",
+        base_url.trim_end_matches('/'),
+        version,
+        arch
+    )
+}
+
+fn download_to_file(url: &str, destination: &Path) -> Result<(), AppError> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
     }
 
-    let work_dir = env::temp_dir().join(format!("cockroach-rollout-{}", unix_time()?));
-    let backup_path = config
+    let request = reqwest::blocking::Client::new()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "cockroach-rollout-agent");
+    let mut response = apply_optional_psk(request).send()?.error_for_status()?;
+    let mut output = fs::File::create(destination)?;
+    io::copy(&mut response, &mut output)?;
+    Ok(())
+}
+
+fn fetch_text(url: &str) -> Result<String, AppError> {
+    let request = reqwest::blocking::Client::new()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "cockroach-rollout-agent");
+    Ok(apply_optional_psk(request)
+        .send()?
+        .error_for_status()?
+        .text()?)
+}
+
+fn apply_optional_psk(
+    request: reqwest::blocking::RequestBuilder,
+) -> reqwest::blocking::RequestBuilder {
+    match std::env::var("CROACH_ROLLOUT_PSK") {
+        Ok(psk) if !psk.is_empty() => request.bearer_auth(psk),
+        _ => request,
+    }
+}
+
+fn verify_artifact(path: &Path, artifact: &Artifact) -> Result<(), AppError> {
+    if !path.is_file() {
+        return Err(AppError::Message(format!(
+            "artifact is missing: {}",
+            path.display()
+        )));
+    }
+    let (sha256, bytes) = sha256_file(path)?;
+    if sha256 != artifact.sha256 {
+        return Err(AppError::Message(format!(
+            "sha256 mismatch for {}: expected={} actual={}",
+            path.display(),
+            artifact.sha256,
+            sha256
+        )));
+    }
+    if bytes != artifact.bytes {
+        return Err(AppError::Message(format!(
+            "size mismatch for {}: expected={} actual={}",
+            path.display(),
+            artifact.bytes,
+            bytes
+        )));
+    }
+    Ok(())
+}
+
+fn install_artifact(cli: &Cli, artifact: &Path) -> Result<(), AppError> {
+    let work_dir = tempfile::Builder::new()
+        .prefix("cockroach-rollout-")
+        .tempdir()?;
+    let backup_path = cli
         .binary_path
         .with_extension(format!("bak.{}", unix_time()?));
 
-    fs::create_dir_all(&work_dir).map_err(display_error)?;
     audit(
-        config,
+        cli,
         "install_start",
         &format!(
             "artifact={} binary={}",
             artifact.display(),
-            config.binary_path.display()
+            cli.binary_path.display()
         ),
     )?;
 
     run_command(
         "tar",
         [
-            OsStr::new("-xzf"),
+            "-xzf".as_ref(),
             artifact.as_os_str(),
-            OsStr::new("-C"),
-            work_dir.as_os_str(),
+            "-C".as_ref(),
+            work_dir.path().as_os_str(),
         ],
     )?;
-    let extracted = find_cockroach_binary(&work_dir)?;
+    let extracted = find_cockroach_binary(work_dir.path())?;
 
     run_command(
         "systemctl",
-        [OsStr::new("stop"), OsStr::new(&config.service_name)],
+        [OsStr::new("stop"), OsStr::new(&cli.service_name)],
     )?;
-    fs::copy(&config.binary_path, &backup_path).map_err(display_error)?;
-    fs::copy(&extracted, &config.binary_path).map_err(display_error)?;
-    run_command(
-        "chmod",
-        [OsStr::new("0755"), config.binary_path.as_os_str()],
-    )?;
+    fs::copy(&cli.binary_path, &backup_path)?;
+    fs::copy(&extracted, &cli.binary_path)?;
+    run_command("chmod", ["0755".as_ref(), cli.binary_path.as_os_str()])?;
     run_command(
         "systemctl",
-        [OsStr::new("start"), OsStr::new(&config.service_name)],
+        [OsStr::new("start"), OsStr::new(&cli.service_name)],
     )?;
 
     audit(
-        config,
+        cli,
         "install_complete",
         &format!(
             "backup={} binary={}",
             backup_path.display(),
-            config.binary_path.display()
+            cli.binary_path.display()
         ),
     )?;
     Ok(())
 }
 
-fn daemon_command(config: &Config) -> Result<(), String> {
-    audit(
-        config,
-        "daemon_start",
-        "daemon scaffold started; consensus transport is intentionally not enabled yet",
-    )?;
-    println!("daemon scaffold is installed");
-    println!(
-        "next implementation step: acquire CockroachDB-backed rollout lease before fetch/install"
-    );
-    println!("service={}", config.service_name);
-    println!("binary={}", config.binary_path.display());
-    Ok(())
-}
-
-fn self_check_command(config: &Config) -> Result<(), String> {
-    audit(
-        config,
-        "self_check_start",
-        "validating local permissions and commands",
-    )?;
-    require_command("curl")?;
-    require_command("tar")?;
-    require_command("systemctl")?;
-
-    if !config.binary_path.exists() {
-        return Err(format!(
-            "binary path does not exist: {}",
-            config.binary_path.display()
-        ));
-    }
-
-    let parent = config.binary_path.parent().ok_or_else(|| {
-        format!(
-            "binary path has no parent: {}",
-            config.binary_path.display()
-        )
-    })?;
-
-    if !parent.is_dir() {
-        return Err(format!(
-            "binary parent is not a directory: {}",
-            parent.display()
-        ));
-    }
-
-    audit(config, "self_check_complete", "local validation completed")?;
-    Ok(())
-}
-
-fn cockroach_url(base_url: &str, version: &str, arch: &str) -> String {
-    if version == "latest" {
-        format!("{base_url}/cockroach-latest.linux-{arch}.tgz")
-    } else {
-        format!("{base_url}/cockroach-{version}.linux-{arch}.tgz")
-    }
-}
-
-fn find_cockroach_binary(root: &Path) -> Result<PathBuf, String> {
+fn find_cockroach_binary(root: &Path) -> Result<PathBuf, AppError> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
-        for entry in fs::read_dir(&path).map_err(display_error)? {
-            let entry = entry.map_err(display_error)?;
+        for entry in fs::read_dir(&path)? {
+            let entry = entry?;
             let entry_path = entry.path();
             if entry_path.is_dir() {
                 stack.push(entry_path);
-            } else if entry_path.file_name() == Some(OsStr::new("cockroach")) {
+            } else if entry_path
+                .file_name()
+                .is_some_and(|name| name == "cockroach")
+            {
                 return Ok(entry_path);
             }
         }
     }
-    Err(format!(
+    Err(AppError::Message(format!(
         "no cockroach binary found under {}",
         root.display()
-    ))
+    )))
 }
 
-fn require_command(name: &str) -> Result<(), String> {
+fn require_command(name: &str) -> Result<(), AppError> {
     let status = Command::new("sh")
         .arg("-c")
         .arg(format!("command -v {name} >/dev/null 2>&1"))
-        .status()
-        .map_err(display_error)?;
+        .status()?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("required command is unavailable: {name}"))
+        Err(AppError::Message(format!(
+            "required command is unavailable: {name}"
+        )))
     }
 }
 
-fn run_command<I, S>(program: &str, args: I) -> Result<(), String>
+fn run_command<I, S>(program: &str, args: I) -> Result<(), AppError>
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
+    S: AsRef<std::ffi::OsStr>,
 {
     let status = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
-        .status()
-        .map_err(display_error)?;
+        .status()?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(format!("{program} exited with status {status}"))
+        Err(AppError::Message(format!(
+            "{program} exited with status {status}"
+        )))
     }
 }
 
-fn audit(config: &Config, event: &str, detail: &str) -> Result<(), String> {
-    if let Some(parent) = config.audit_log.parent() {
-        fs::create_dir_all(parent).map_err(display_error)?;
+fn sha256_file(path: &Path) -> Result<(String, u64), AppError> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok((hex::encode(hasher.finalize()), total))
+}
+
+fn read_json_file<T>(path: &Path) -> Result<T, AppError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let bytes = fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn write_json_file<T>(path: &Path, value: &T) -> Result<(), AppError>
+where
+    T: Serialize,
+{
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::File::create(path)?;
+    serde_json::to_writer_pretty(&mut file, value)?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+fn audit(cli: &Cli, event: &str, detail: &str) -> Result<(), AppError> {
+    if let Some(parent) = cli.audit_log.parent() {
+        fs::create_dir_all(parent)?;
     }
 
     let line = format!(
@@ -295,12 +1028,11 @@ fn audit(config: &Config, event: &str, detail: &str) -> Result<(), String> {
         sanitize_log_field(event),
         sanitize_log_field(detail)
     );
-    append_file(&config.audit_log, line.as_bytes()).map_err(display_error)
+    append_file(&cli.audit_log, line.as_bytes())?;
+    Ok(())
 }
 
 fn append_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -312,31 +1044,107 @@ fn sanitize_log_field(value: &str) -> String {
     value.replace(['\n', '\r'], " ")
 }
 
-fn unix_time() -> Result<u64, String> {
-    SystemTime::now()
+fn normalized_arch() -> String {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64".to_string(),
+        "aarch64" => "arm64".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn unix_time() -> Result<u64, AppError> {
+    Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .map_err(display_error)
+        .map_err(|error| AppError::Message(error.to_string()))?
+        .as_secs())
 }
 
-fn display_error(error: impl std::fmt::Display) -> String {
-    error.to_string()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn print_help() {
-    println!("cockroach-rollout-agent");
-    println!();
-    println!("Commands:");
-    println!("  fetch        Download latest CockroachDB Linux amd64 and arm64 tarballs");
-    println!("  install PATH Stop systemd service, replace binary from tarball, restart service");
-    println!("  daemon       Start daemon scaffold");
-    println!("  self-check   Validate local commands and binary path");
-    println!();
-    println!("Environment:");
-    println!("  CROACH_ROLLOUT_BASE_URL       Default: {DEFAULT_BASE_URL}");
-    println!("  CROACH_ROLLOUT_VERSION        Default: {DEFAULT_VERSION}");
-    println!("  CROACH_ROLLOUT_ARTIFACTS_DIR  Default: dist");
-    println!("  CROACH_ROLLOUT_SERVICE        Default: cockroachdb.service");
-    println!("  CROACH_ROLLOUT_BINARY_PATH    Default: /usr/local/bin/cockroach");
-    println!("  CROACH_ROLLOUT_AUDIT_LOG      Default: /var/log/cockroach-rollout-agent/audit.log");
+    #[test]
+    fn parse_version_from_tag() {
+        let version = parse_cockroach_version("v26.2.1").expect("version should parse");
+        assert_eq!(
+            version,
+            Version::parse("26.2.1").expect("literal should parse")
+        );
+    }
+
+    #[test]
+    fn parse_version_from_command_output() {
+        let version =
+            parse_cockroach_version("CockroachDB CCL v25.4.3").expect("version should parse");
+        assert_eq!(
+            version,
+            Version::parse("25.4.3").expect("literal should parse")
+        );
+    }
+
+    #[test]
+    fn parses_and_rejects_alpha_versions() {
+        let version = parse_cockroach_version("v26.3.0-alpha.1").expect("version should parse");
+        assert_eq!(version.pre.as_str(), "alpha.1");
+        assert!(reject_prerelease(&version).is_err());
+    }
+
+    #[test]
+    fn builds_release_line_steps() {
+        let current = Version::parse("24.1.25").expect("literal should parse");
+        let target = Version::parse("25.2.9").expect("literal should parse");
+        let available = vec![
+            Version::parse("24.3.23").expect("literal should parse"),
+            Version::parse("25.1.10").expect("literal should parse"),
+            Version::parse("25.2.9").expect("literal should parse"),
+        ];
+
+        let steps = build_upgrade_steps(
+            &current,
+            &target,
+            &available,
+            "https://www.cockroachlabs.com/docs/releases",
+        )
+        .expect("steps should build");
+
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].to_version, Version::parse("24.3.23").unwrap());
+        assert_eq!(steps[1].to_version, Version::parse("25.1.10").unwrap());
+        assert_eq!(steps[2].to_version, Version::parse("25.2.9").unwrap());
+        assert!(steps.iter().all(|step| step.requires_finalization));
+    }
+
+    #[test]
+    fn patch_upgrade_is_single_non_finalizing_step() {
+        let current = Version::parse("25.2.7").expect("literal should parse");
+        let target = Version::parse("25.2.9").expect("literal should parse");
+        let available = vec![target.clone()];
+        let steps = build_upgrade_steps(
+            &current,
+            &target,
+            &available,
+            "https://www.cockroachlabs.com/docs/releases",
+        )
+        .expect("steps should build");
+
+        assert_eq!(steps.len(), 1);
+        assert!(!steps[0].requires_finalization);
+    }
+
+    #[test]
+    fn release_notes_url_uses_official_path_shape() {
+        let version = Version::parse("26.2.1").expect("literal should parse");
+        assert_eq!(
+            release_notes_url("https://www.cockroachlabs.com/docs/releases/", &version),
+            "https://www.cockroachlabs.com/docs/releases/v26.2"
+        );
+    }
+
+    #[test]
+    fn release_note_scan_finds_breaking_patterns() {
+        let warnings =
+            scan_release_notes("Before upgrading, review backward incompatible changes.")
+                .expect("scan should succeed");
+        assert!(warnings.contains(&"backward incompatible".to_string()));
+    }
 }
