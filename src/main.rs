@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
+use postgres::{Client, NoTls};
 use regex::Regex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,9 @@ const DEFAULT_BINARY_PATH: &str = "/usr/local/bin/cockroach";
 const DEFAULT_AUDIT_LOG: &str = "/var/log/cockroach-rollout-agent/audit.log";
 const DEFAULT_MANIFEST_PATH: &str = "dist/manifest.json";
 const DEFAULT_DAEMON_INTERVAL_SECONDS: u64 = 300;
+const DEFAULT_LEASE_SECONDS: u64 = 90;
+const DEFAULT_AGENT_STALE_SECONDS: u64 = 300;
+const DEFAULT_SCHEMA: &str = "cockroach_rollout";
 const SUPPORTED_ARCHES: &[&str] = &["amd64", "arm64"];
 const BREAKING_CHANGE_PATTERNS: &[&str] = &[
     "backward incompatible",
@@ -83,6 +87,15 @@ struct Cli {
 
     #[arg(long, env = "CROACH_ROLLOUT_AUDIT_LOG", default_value = DEFAULT_AUDIT_LOG)]
     audit_log: PathBuf,
+
+    #[arg(long, env = "CROACH_ROLLOUT_DATABASE_URL")]
+    database_url: Option<String>,
+
+    #[arg(long, env = "CROACH_ROLLOUT_SCHEMA", default_value = DEFAULT_SCHEMA)]
+    schema: String,
+
+    #[arg(long, env = "CROACH_ROLLOUT_NODE_ID")]
+    node_id: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -141,7 +154,21 @@ enum Commands {
 
         #[arg(long)]
         dry_run: bool,
+
+        /// Permit release-note warning matches when this daemon is elected leader.
+        #[arg(long)]
+        allow_breaking_warnings: bool,
+
+        /// Finalize major-line upgrades after all discovered live nodes report the target binary.
+        #[arg(long)]
+        auto_finalize: bool,
     },
+
+    /// Initialize the CockroachDB SQL coordination schema.
+    InitDb,
+
+    /// Print discovered CockroachDB nodes from crdb_internal.gossip_nodes.
+    Discover,
 
     /// Finalize a major-version upgrade after every node is on the new binary.
     Finalize {
@@ -177,6 +204,9 @@ enum AppError {
 
     #[error(transparent)]
     Regex(#[from] regex::Error),
+
+    #[error(transparent)]
+    Postgres(#[from] postgres::Error),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -228,6 +258,25 @@ struct Artifact {
     bytes: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DiscoveredNode {
+    node_id: i64,
+    address: String,
+    sql_address: Option<String>,
+    is_live: Option<bool>,
+}
+
+#[derive(Debug)]
+struct LeaseResult {
+    is_leader: bool,
+    holder_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DbRolloutRow {
+    manifest_json: String,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -271,13 +320,19 @@ fn run() -> Result<(), AppError> {
             manifest_file,
             interval_seconds,
             dry_run,
+            allow_breaking_warnings,
+            auto_finalize,
         } => daemon_command(
             &cli,
             manifest_url.as_deref(),
             manifest_file.as_deref(),
             *interval_seconds,
             *dry_run,
+            *allow_breaking_warnings,
+            *auto_finalize,
         ),
+        Commands::InitDb => init_db_command(&cli),
+        Commands::Discover => discover_command(&cli),
         Commands::Finalize {
             target_version,
             dry_run,
@@ -465,13 +520,24 @@ fn daemon_command(
     manifest_file: Option<&Path>,
     interval_seconds: u64,
     dry_run: bool,
+    allow_breaking_warnings: bool,
+    auto_finalize: bool,
 ) -> Result<(), AppError> {
-    if manifest_url.is_none() && manifest_file.is_none() {
-        return Err(AppError::Message(
-            "daemon requires --manifest-url or --manifest-file".to_string(),
-        ));
+    if cli.database_url.is_some() {
+        return db_daemon_command(
+            cli,
+            interval_seconds,
+            dry_run,
+            allow_breaking_warnings,
+            auto_finalize,
+        );
     }
 
+    if manifest_url.is_none() && manifest_file.is_none() {
+        return Err(AppError::Message(
+            "daemon requires --manifest-url, --manifest-file, or --database-url".to_string(),
+        ));
+    }
     audit(cli, "daemon_start", "polling manifest source")?;
     loop {
         let result = poll_and_install_manifest(cli, manifest_url, manifest_file, dry_run);
@@ -501,6 +567,513 @@ fn poll_and_install_manifest(
     }
 
     install_command(cli, manifest_path.path(), None, dry_run)
+}
+
+fn init_db_command(cli: &Cli) -> Result<(), AppError> {
+    let mut client = db_client(cli)?;
+    ensure_schema(cli, &mut client)?;
+    println!("initialized SQL coordination schema {}", cli.schema);
+    Ok(())
+}
+
+fn discover_command(cli: &Cli) -> Result<(), AppError> {
+    let mut client = db_client(cli)?;
+    let nodes = discover_nodes(&mut client)?;
+    println!("{}", serde_json::to_string_pretty(&nodes)?);
+    Ok(())
+}
+
+fn db_daemon_command(
+    cli: &Cli,
+    interval_seconds: u64,
+    dry_run: bool,
+    allow_breaking_warnings: bool,
+    auto_finalize: bool,
+) -> Result<(), AppError> {
+    let node_id = agent_node_id(cli)?;
+    audit(
+        cli,
+        "db_daemon_start",
+        &format!("node_id={node_id} schema={}", cli.schema),
+    )?;
+
+    loop {
+        if let Err(error) = db_daemon_tick(
+            cli,
+            &node_id,
+            dry_run,
+            allow_breaking_warnings,
+            auto_finalize,
+        ) {
+            audit(cli, "db_daemon_tick_failed", &error.to_string())?;
+            eprintln!("db daemon tick failed: {error}");
+        }
+        thread::sleep(Duration::from_secs(interval_seconds));
+    }
+}
+
+fn db_daemon_tick(
+    cli: &Cli,
+    agent_id: &str,
+    dry_run: bool,
+    allow_breaking_warnings: bool,
+    auto_finalize: bool,
+) -> Result<(), AppError> {
+    let mut client = db_client(cli)?;
+    ensure_schema(cli, &mut client)?;
+    let current = installed_cockroach_version(&cli.binary_path)?;
+    let lease = acquire_lease(cli, &mut client, agent_id)?;
+    let nodes = discover_nodes(&mut client)?;
+    heartbeat_agent(cli, &mut client, agent_id, &current)?;
+
+    if lease.is_leader {
+        audit(cli, "leader_acquired", &format!("node_id={agent_id}"))?;
+        leader_reconcile(
+            cli,
+            &mut client,
+            &current,
+            &nodes,
+            allow_breaking_warnings,
+            auto_finalize,
+            dry_run,
+        )?;
+    } else {
+        audit(
+            cli,
+            "leader_observed",
+            &format!("holder={}", lease.holder_id),
+        )?;
+    }
+
+    follower_reconcile(cli, &mut client, dry_run)
+}
+
+fn leader_reconcile(
+    cli: &Cli,
+    client: &mut Client,
+    current: &Version,
+    nodes: &[DiscoveredNode],
+    allow_breaking_warnings: bool,
+    auto_finalize: bool,
+    dry_run: bool,
+) -> Result<(), AppError> {
+    if let Some(active) = active_rollout(cli, client)? {
+        let manifest: RolloutManifest = serde_json::from_str(&active.manifest_json)?;
+        if rollout_is_complete(cli, client, &manifest, nodes)? {
+            audit(
+                cli,
+                "rollout_complete",
+                &format!("target={}", manifest.target_version),
+            )?;
+            if auto_finalize
+                && major_line(&manifest.current_version) != major_line(&manifest.target_version)
+            {
+                if dry_run {
+                    audit(
+                        cli,
+                        "finalize_ready_dry_run",
+                        &format!("target={}", manifest.target_version),
+                    )?;
+                } else {
+                    finalize_command(cli, &manifest.target_version.to_string(), false)?;
+                    mark_rollout_finalized(cli, client, &manifest.target_version)?;
+                }
+            } else if major_line(&manifest.current_version) == major_line(&manifest.target_version)
+            {
+                mark_rollout_finalized(cli, client, &manifest.target_version)?;
+            } else {
+                audit(
+                    cli,
+                    "rollout_waiting_for_finalization",
+                    &format!("target={}", manifest.target_version),
+                )?;
+            }
+        }
+        return Ok(());
+    }
+
+    let plan = build_upgrade_plan(cli, Some(&current.to_string()), None)?;
+    let manifest = create_manifest_for_plan(cli, plan, allow_breaking_warnings)?;
+    publish_rollout(cli, client, &manifest)?;
+    Ok(())
+}
+
+fn follower_reconcile(cli: &Cli, client: &mut Client, dry_run: bool) -> Result<(), AppError> {
+    let Some(active) = active_rollout(cli, client)? else {
+        return Ok(());
+    };
+
+    let manifest: RolloutManifest = serde_json::from_str(&active.manifest_json)?;
+    let current = installed_cockroach_version(&cli.binary_path)?;
+    if current == manifest.target_version {
+        record_agent_state(cli, client, "complete", &current, None)?;
+        return Ok(());
+    }
+
+    if current != manifest.current_version {
+        record_agent_state(
+            cli,
+            client,
+            "waiting",
+            &current,
+            Some(&format!(
+                "active rollout expects current={} target={}",
+                manifest.current_version, manifest.target_version
+            )),
+        )?;
+        return Ok(());
+    }
+
+    let artifact = manifest
+        .artifacts
+        .iter()
+        .find(|candidate| candidate.os == "linux" && candidate.arch == normalized_arch())
+        .ok_or_else(|| {
+            AppError::Message("active manifest lacks artifact for this host arch".to_string())
+        })?;
+    let artifact_path = Path::new(&artifact.path);
+    if !artifact_path.exists() {
+        download_to_file(&artifact.url, artifact_path)?;
+    }
+    verify_artifact(artifact_path, artifact)?;
+    record_agent_state(cli, client, "installing", &current, None)?;
+
+    let manifest_file = tempfile::Builder::new()
+        .prefix("cockroach-rollout-active-")
+        .suffix(".json")
+        .tempfile()?;
+    write_json_file(manifest_file.path(), &manifest)?;
+    install_command(cli, manifest_file.path(), None, dry_run)?;
+    let new_version = if dry_run {
+        current
+    } else {
+        installed_cockroach_version(&cli.binary_path)?
+    };
+    record_agent_state(cli, client, "complete", &new_version, None)?;
+    Ok(())
+}
+
+fn db_client(cli: &Cli) -> Result<Client, AppError> {
+    let database_url = cli.database_url.as_deref().ok_or_else(|| {
+        AppError::Message("--database-url or CROACH_ROLLOUT_DATABASE_URL is required".to_string())
+    })?;
+    Ok(Client::connect(database_url, NoTls)?)
+}
+
+fn ensure_schema(cli: &Cli, client: &mut Client) -> Result<(), AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    client.batch_execute(&format!(
+        "
+        CREATE SCHEMA IF NOT EXISTS {schema};
+        CREATE TABLE IF NOT EXISTS {schema}.leases (
+            name STRING PRIMARY KEY,
+            holder_id STRING NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS {schema}.rollouts (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            status STRING NOT NULL,
+            current_version STRING NOT NULL,
+            target_version STRING NOT NULL,
+            manifest_json STRING NOT NULL,
+            created_by STRING NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            finalized_at TIMESTAMPTZ NULL
+        );
+        CREATE TABLE IF NOT EXISTS {schema}.agent_status (
+            agent_id STRING PRIMARY KEY,
+            state STRING NOT NULL,
+            version STRING NOT NULL,
+            error STRING NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        "
+    ))?;
+    Ok(())
+}
+
+fn acquire_lease(cli: &Cli, client: &mut Client, holder_id: &str) -> Result<LeaseResult, AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    client.execute(
+        &format!(
+            "
+            INSERT INTO {schema}.leases (name, holder_id, expires_at, updated_at)
+            VALUES ('leader', $1, now() + ($2::INT8 * INTERVAL '1 second'), now())
+            ON CONFLICT (name) DO NOTHING
+            "
+        ),
+        &[&holder_id, &(DEFAULT_LEASE_SECONDS as i64)],
+    )?;
+
+    let rows = client.query(
+        &format!(
+            "
+            UPDATE {schema}.leases
+            SET holder_id = $1,
+                expires_at = now() + ($2::INT8 * INTERVAL '1 second'),
+                updated_at = now()
+            WHERE name = 'leader'
+              AND (holder_id = $1 OR expires_at < now())
+            RETURNING holder_id
+            "
+        ),
+        &[&holder_id, &(DEFAULT_LEASE_SECONDS as i64)],
+    )?;
+    if let Some(row) = rows.first() {
+        let current_holder: String = row.get(0);
+        return Ok(LeaseResult {
+            is_leader: current_holder == holder_id,
+            holder_id: current_holder,
+        });
+    }
+
+    let row = client.query_one(
+        &format!("SELECT holder_id FROM {schema}.leases WHERE name = 'leader'"),
+        &[],
+    )?;
+    let current_holder: String = row.get(0);
+    Ok(LeaseResult {
+        is_leader: current_holder == holder_id,
+        holder_id: current_holder,
+    })
+}
+
+fn discover_nodes(client: &mut Client) -> Result<Vec<DiscoveredNode>, AppError> {
+    let rows = client.query(
+        "
+        SELECT node_id, address, sql_address, is_live
+        FROM crdb_internal.gossip_nodes
+        WHERE is_live
+        ORDER BY node_id
+        ",
+        &[],
+    )?;
+    let mut nodes = Vec::new();
+    for row in rows {
+        nodes.push(DiscoveredNode {
+            node_id: row.get(0),
+            address: row.get(1),
+            sql_address: row.get(2),
+            is_live: row.get(3),
+        });
+    }
+    Ok(nodes)
+}
+
+fn heartbeat_agent(
+    cli: &Cli,
+    client: &mut Client,
+    agent_id: &str,
+    version: &Version,
+) -> Result<(), AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    client.execute(
+        &format!(
+            "
+            UPSERT INTO {schema}.agent_status (agent_id, state, version, error, updated_at)
+            VALUES ($1, 'running', $2, NULL, now())
+            "
+        ),
+        &[&agent_id, &version.to_string()],
+    )?;
+    Ok(())
+}
+
+fn record_agent_state(
+    cli: &Cli,
+    client: &mut Client,
+    state: &str,
+    version: &Version,
+    error: Option<&str>,
+) -> Result<(), AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    let agent_id = agent_node_id(cli)?;
+    client.execute(
+        &format!(
+            "
+            UPSERT INTO {schema}.agent_status (agent_id, state, version, error, updated_at)
+            VALUES ($1, $2, $3, $4, now())
+            "
+        ),
+        &[&agent_id, &state, &version.to_string(), &error],
+    )?;
+    Ok(())
+}
+
+fn active_rollout(cli: &Cli, client: &mut Client) -> Result<Option<DbRolloutRow>, AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    let rows = client.query(
+        &format!(
+            "
+            SELECT manifest_json
+            FROM {schema}.rollouts
+            WHERE status = 'active'
+            ORDER BY created_at DESC
+            LIMIT 1
+            "
+        ),
+        &[],
+    )?;
+    Ok(rows.into_iter().next().map(|row| DbRolloutRow {
+        manifest_json: row.get(0),
+    }))
+}
+
+fn create_manifest_for_plan(
+    cli: &Cli,
+    plan: UpgradePlan,
+    allow_breaking_warnings: bool,
+) -> Result<RolloutManifest, AppError> {
+    if !plan.release_note_warnings.is_empty() && !allow_breaking_warnings {
+        return Err(AppError::Message(format!(
+            "release notes contain warning patterns; rerun daemon with --allow-breaking-warnings after review: {}",
+            plan.release_notes_url
+        )));
+    }
+
+    fs::create_dir_all(&cli.artifacts_dir)?;
+    let mut artifacts = Vec::new();
+    for arch in SUPPORTED_ARCHES {
+        let url = cockroach_url(&cli.base_url, &plan.next_version, arch);
+        let destination = cli.artifacts_dir.join(format!(
+            "cockroach-{}.linux-{}.tgz",
+            plan.next_version, arch
+        ));
+        if !destination.exists() {
+            download_to_file(&url, &destination)?;
+        }
+        let (sha256, bytes) = sha256_file(&destination)?;
+        artifacts.push(Artifact {
+            os: "linux".to_string(),
+            arch: (*arch).to_string(),
+            url,
+            path: destination.to_string_lossy().into_owned(),
+            sha256,
+            bytes,
+        });
+    }
+
+    Ok(RolloutManifest {
+        schema_version: 1,
+        created_unix: unix_time()?,
+        current_version: plan.current_version,
+        target_version: plan.next_version,
+        release_notes_url: plan.release_notes_url,
+        release_note_warnings: plan.release_note_warnings,
+        release_note_warnings_approved: allow_breaking_warnings,
+        artifacts,
+    })
+}
+
+fn publish_rollout(
+    cli: &Cli,
+    client: &mut Client,
+    manifest: &RolloutManifest,
+) -> Result<(), AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    let agent_id = agent_node_id(cli)?;
+    let manifest_json = serde_json::to_string(manifest)?;
+    client.execute(
+        &format!(
+            "
+            INSERT INTO {schema}.rollouts
+                (status, current_version, target_version, manifest_json, created_by)
+            VALUES ('active', $1, $2, $3, $4)
+            "
+        ),
+        &[
+            &manifest.current_version.to_string(),
+            &manifest.target_version.to_string(),
+            &manifest_json,
+            &agent_id,
+        ],
+    )?;
+    audit(
+        cli,
+        "rollout_published",
+        &format!(
+            "current={} target={}",
+            manifest.current_version, manifest.target_version
+        ),
+    )?;
+    Ok(())
+}
+
+fn rollout_is_complete(
+    cli: &Cli,
+    client: &mut Client,
+    manifest: &RolloutManifest,
+    nodes: &[DiscoveredNode],
+) -> Result<bool, AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    let live_count = nodes.len() as i64;
+    if live_count == 0 {
+        return Ok(false);
+    }
+
+    let row = client.query_one(
+        &format!(
+            "
+            SELECT count(*)
+            FROM {schema}.agent_status
+            WHERE state = 'complete'
+              AND version = $1
+              AND updated_at > now() - ($2::INT8 * INTERVAL '1 second')
+            "
+        ),
+        &[
+            &manifest.target_version.to_string(),
+            &(DEFAULT_AGENT_STALE_SECONDS as i64),
+        ],
+    )?;
+    let complete_count: i64 = row.get(0);
+    Ok(complete_count >= live_count)
+}
+
+fn mark_rollout_finalized(
+    cli: &Cli,
+    client: &mut Client,
+    target_version: &Version,
+) -> Result<(), AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    client.execute(
+        &format!(
+            "
+            UPDATE {schema}.rollouts
+            SET status = 'finalized',
+                finalized_at = now()
+            WHERE status = 'active'
+              AND target_version = $1
+            "
+        ),
+        &[&target_version.to_string()],
+    )?;
+    Ok(())
+}
+
+fn agent_node_id(cli: &Cli) -> Result<String, AppError> {
+    if let Some(node_id) = &cli.node_id {
+        return Ok(node_id.clone());
+    }
+    let hostname = hostname::get()
+        .map_err(AppError::Io)?
+        .to_string_lossy()
+        .into_owned();
+    Ok(format!("{hostname}:{}", normalized_arch()))
+}
+
+fn sql_ident(value: &str) -> Result<String, AppError> {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        Ok(value.to_string())
+    } else {
+        Err(AppError::Message(format!(
+            "invalid SQL identifier: {value}"
+        )))
+    }
 }
 
 fn finalize_command(cli: &Cli, target_version: &str, dry_run: bool) -> Result<(), AppError> {

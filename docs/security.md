@@ -1,5 +1,5 @@
 <!-- file: docs/security.md -->
-<!-- version: 1.3.0 -->
+<!-- version: 2.0.0 -->
 <!-- guid: b1107208-a9c3-4018-9e86-a44cbf5c7f79 -->
 <!-- last-edited: 2026-05-25 -->
 
@@ -25,6 +25,9 @@ The rollout agent must be treated as privileged infrastructure automation.
   cluster's existing quorum decides who is leader.
 - Network discovery is only a hint. Trust comes from TLS identity, artifact
   signatures, and the CockroachDB-backed lease.
+- In SQL-coordinated mode, CockroachDB SQL is the trust root for rollout state.
+  A separate PSK is unnecessary when agents authenticate to SQL and validate
+  official artifacts by digest.
 - The daemon should run as `cockroach`, not root.
 - Any service-management privilege must be restricted to the CockroachDB
   service only.

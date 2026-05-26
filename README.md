@@ -1,5 +1,5 @@
 <!-- file: README.md -->
-<!-- version: 2.3.0 -->
+<!-- version: 3.0.0 -->
 <!-- guid: c68a62ce-72d1-45cc-a6c8-d3dfc41d0e34 -->
 <!-- last-edited: 2026-05-25 -->
 
@@ -28,6 +28,8 @@ target system, or a secret manager.
   service again.
 - Writes append-only audit events with timestamps and action details.
 - Provides a polling daemon mode that can consume a manifest URL or file.
+- Provides a CockroachDB SQL coordination mode with leader election, cluster
+  discovery, manifest publication, agent heartbeats, and completion tracking.
 
 CockroachDB does not publish official ARMv6 Linux artifacts through the normal
 binary endpoint. The implementation targets `arm64`, which is the supported
@@ -43,6 +45,9 @@ cargo run -- self-check
 cargo run -- install --manifest dist/manifest.json --dry-run
 cargo run -- finalize --target-version v25.4.3 --dry-run
 cargo run -- daemon --manifest-url https://example.invalid/manifest.json --dry-run
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" init-db
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" discover
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" daemon --dry-run
 ```
 
 ## Runtime Configuration
@@ -56,6 +61,9 @@ cargo run -- daemon --manifest-url https://example.invalid/manifest.json --dry-r
 | `CROACH_ROLLOUT_SERVICE` | `cockroachdb.service` |
 | `CROACH_ROLLOUT_BINARY_PATH` | `/usr/local/bin/cockroach` |
 | `CROACH_ROLLOUT_AUDIT_LOG` | `/var/log/cockroach-rollout-agent/audit.log` |
+| `CROACH_ROLLOUT_DATABASE_URL` | unset |
+| `CROACH_ROLLOUT_SCHEMA` | `cockroach_rollout` |
+| `CROACH_ROLLOUT_NODE_ID` | hostname plus architecture |
 | `CROACH_ROLLOUT_CURRENT_VERSION` | unset |
 | `CROACH_ROLLOUT_TARGET_VERSION` | unset |
 | `CROACH_ROLLOUT_MANIFEST_URL` | unset |
@@ -66,18 +74,23 @@ When `CROACH_ROLLOUT_PSK` is set, HTTP downloads use it as a bearer token. This
 supports a simple PSK-over-TLS deployment for manifest hosting. Do not commit
 this value.
 
+For the recommended SQL-coordinated deployment, a PSK is not required. Agents
+authenticate to CockroachDB SQL, discover the cluster from CockroachDB internal
+metadata, read the active rollout manifest from SQL, and download official
+CockroachDB artifacts over HTTPS with SHA-256 validation.
+
 ## Rollout Design
 
 The preferred production design is pull-based:
 
-1. A publisher downloads artifacts and publishes signed metadata.
-2. Agents discover peers from CockroachDB cluster metadata, not from a checked-in
+1. Agents discover peers from CockroachDB cluster metadata, not from a checked-in
    inventory file.
-3. Agents elect one rollout coordinator by acquiring a short-lived SQL lease in
+2. Agents elect one rollout coordinator by acquiring a short-lived SQL lease in
    CockroachDB. This reuses CockroachDB's existing quorum and avoids
    unauthenticated LAN discovery.
-4. The coordinator announces the target version. Agents pull the artifact over
-   mutually authenticated TLS or an equivalent authenticated channel.
+3. The coordinator creates the next-step manifest and publishes it in SQL.
+4. Agents read the manifest from SQL and download the official artifact over
+   HTTPS.
 5. Each agent validates the manifest, confirms the artifact digest, confirms
    the manifest was prepared for the node's current binary version, verifies
    release-note warning approval, stops only its local CockroachDB systemd
@@ -98,6 +111,49 @@ version to create the next step.
 The tool deliberately excludes prerelease versions because CockroachDB warns
 that clusters upgraded to alpha binaries or manually built master binaries
 cannot later be upgraded to a production release.
+
+## SQL Coordination Deployment
+
+Use a CockroachDB SQL user with permission to create and update objects in the
+configured rollout schema. Initialize once:
+
+```bash
+cockroach-rollout-agent \
+  --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" \
+  init-db
+```
+
+Then start the daemon on every CockroachDB host:
+
+```bash
+cockroach-rollout-agent \
+  --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" \
+  daemon
+```
+
+Daemon behavior:
+
+- every agent heartbeats its local binary version into SQL;
+- one agent becomes leader by holding a TTL lease row;
+- the leader discovers live CockroachDB nodes from
+  `crdb_internal.gossip_nodes`;
+- the leader publishes one active manifest for the next required release line;
+- followers download, validate, install, and report completion;
+- patch rollouts are marked finalized after every live node reports completion;
+- major-line rollouts wait for manual `finalize` unless the daemon is started
+  with `--auto-finalize`.
+
+Discovery uses:
+
+```sql
+SELECT node_id, address, sql_address, is_live
+FROM crdb_internal.gossip_nodes
+WHERE is_live;
+```
+
+This means the project does not need a separate Raft library or mDNS trust
+model. CockroachDB already provides consensus for the SQL lease and rollout
+state.
 
 mDNS can be added later as an optional discovery hint, but it should not be the
 trust root. A LAN broadcast protocol is too easy to abuse unless every message
@@ -141,4 +197,5 @@ before unattended fleet rollout:
 
 - manifest signatures, preferably Sigstore or minisign, so digest metadata has
   an authenticity guarantee beyond TLS;
-- CockroachDB SQL lease integration for leader election and rollout quorum.
+- a stricter mapping between discovered CockroachDB node IDs and reporting agent
+  IDs if multiple agents can run outside the CockroachDB hosts.
