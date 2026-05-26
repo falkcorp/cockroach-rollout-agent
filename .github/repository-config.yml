@@ -1,0 +1,35 @@
+# file: .github/repository-config.yml
+# version: 1.0.0
+# guid: 5790d41d-dc47-4056-8940-77013a75f010
+
+repository:
+  name: cockroach-rollout-agent
+  type: rust-cli
+  primary_language: rust
+  description: "Public-safe CockroachDB binary rollout helper and daemon scaffold"
+
+languages:
+  versions:
+    rust:
+      - "stable"
+
+build:
+  platforms:
+    - ubuntu-latest
+
+testing:
+  coverage:
+    rust:
+      threshold: 80
+      format: lcov
+
+workflows:
+  experimental:
+    use_new_ci: true
+    use_new_release: true
+    use_config_matrices: true
+
+packages:
+  registries:
+    github: true
+    cargo: false

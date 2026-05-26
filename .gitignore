@@ -1,0 +1,10 @@
+/target
+dist/
+*.tgz
+*.tar.gz
+*.bak.*
+audit.log
+.env
+*.pem
+*.key
+*.crt

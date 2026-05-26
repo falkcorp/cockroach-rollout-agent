@@ -1,0 +1,45 @@
+# file: .github/workflows/release.yml
+# version: 1.0.0
+# guid: c25dc371-fc1b-4741-8cd1-2fb0046cb7b1
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release-type:
+        description: "Release type"
+        required: false
+        type: choice
+        options:
+          - auto
+          - major
+          - minor
+          - patch
+        default: auto
+      stable:
+        description: "Create a stable release directly"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  release:
+    name: Reusable Release
+    uses: jdfalk/ghcommon/.github/workflows/reusable-release.yml@main
+    with:
+      release-type: ${{ inputs.release-type || 'auto' }}
+      build-target: rust
+      rust-enabled: true
+      stable: ${{ inputs.stable || false }}
+    secrets: inherit

@@ -1,0 +1,9 @@
+# file: .github/CODEOWNERS
+# version: 1.0.0
+# guid: b1a01d6d-4b0f-4966-8ae0-5df0aad926fe
+
+* @jdfalk
+
+.github/workflows/ @jdfalk
+docs/ @jdfalk
+examples/ @jdfalk

@@ -1,0 +1,24 @@
+# file: .github/workflows/ci.yml
+# version: 1.0.0
+# guid: 9d4b6f66-6d08-45e9-a8ef-5604a0bb4aef
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Reusable CI
+    uses: jdfalk/ghcommon/.github/workflows/reusable-ci.yml@main
+    with:
+      rust-version: stable
+      skip-protobuf: true
+      skip-e2e-tests: true

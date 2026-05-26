@@ -1,0 +1,23 @@
+# file: examples/cockroach-rollout-agent.service
+# version: 1.0.0
+# guid: eaf842e1-7611-4539-848e-73b84ed31c7e
+
+[Unit]
+Description=CockroachDB Rollout Agent
+After=network-online.target cockroachdb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cockroach
+Group=cockroach
+ExecStart=/usr/local/bin/cockroach-rollout-agent daemon
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/cockroach-rollout-agent /var/lib/cockroach-rollout-agent /usr/local/bin
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+[package]
+name = "cockroach-rollout-agent"
+version = "0.1.0"
+edition = "2024"
+authors = ["jdfalk <jdfalk@users.noreply.github.com>"]
+license = "MIT"
+description = "Public-safe CockroachDB binary rollout helper and daemon scaffold"
+homepage = "https://github.com/jdfalk/cockroach-rollout-agent"
+repository = "https://github.com/jdfalk/cockroach-rollout-agent"
+readme = "README.md"
+keywords = ["cockroachdb", "rollout", "upgrade", "systemd"]
+categories = ["command-line-utilities"]
+rust-version = "1.85"
+
+[[bin]]
+name = "cockroach-rollout-agent"
+path = "src/main.rs"
+
+[dependencies]
