@@ -1,0 +1,13 @@
+# file: examples/cockroach-rollout-agent.sudoers
+# version: 1.0.0
+# guid: 6fb2c50e-7bd0-436b-859b-ea14453b03cf
+
+# Optional sudoers fragment for systems where the cockroach user cannot manage
+# cockroachdb.service directly. Install as:
+# /etc/sudoers.d/cockroach-rollout-agent
+#
+# Validate with visudo before deploying.
+
+cockroach ALL=(root) NOPASSWD: /bin/systemctl stop cockroachdb.service
+cockroach ALL=(root) NOPASSWD: /bin/systemctl start cockroachdb.service
+cockroach ALL=(root) NOPASSWD: /bin/systemctl restart cockroachdb.service

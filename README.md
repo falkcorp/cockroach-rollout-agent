@@ -1,5 +1,5 @@
 <!-- file: README.md -->
-<!-- version: 3.1.0 -->
+<!-- version: 3.2.0 -->
 <!-- guid: c68a62ce-72d1-45cc-a6c8-d3dfc41d0e34 -->
 <!-- last-edited: 2026-05-25 -->
 
@@ -113,6 +113,8 @@ that clusters upgraded to alpha binaries or manually built master binaries
 cannot later be upgraded to a production release.
 
 ## SQL Coordination Deployment
+
+For a complete host deployment walkthrough, see [Deployment](docs/deploy.md).
 
 Use a CockroachDB SQL user with permission to create and update objects in the
 configured rollout schema. Initialize once:
