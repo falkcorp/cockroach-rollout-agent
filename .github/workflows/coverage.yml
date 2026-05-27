@@ -1,0 +1,49 @@
+# file: .github/workflows/coverage.yml
+# version: 1.0.1
+# guid: 4f094b99-d830-465a-b726-40ac118cd985
+
+name: Code Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  code-quality: write
+
+jobs:
+  coverage:
+    name: Rust Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@02be93da58aa71fb456aa9c43b301149248829d8 # v1.15.1
+        with:
+          toolchain: "1.85"
+          components: llvm-tools-preview
+          cache: true
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Generate Cobertura coverage
+        run: cargo llvm-cov --workspace --locked --cobertura --output-path coverage.xml
+
+      - name: Upload coverage report
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-code-coverage@abb5995db9e0199b0e2bb9dbd136fce4cb1ec4d3 # v1
+        with:
+          # The published v1 action metadata requires `file`; the docs example
+          # currently says `report`, which would fail action input validation.
+          file: coverage.xml
+          language: Rust
+          label: code-coverage/cargo-llvm-cov

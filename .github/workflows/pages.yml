@@ -1,5 +1,5 @@
 # file: .github/workflows/pages.yml
-# version: 1.0.0
+# version: 1.0.1
 # guid: 14d75f8c-45eb-46df-a445-f06f6b71ead4
 
 name: Pages
@@ -53,4 +53,4 @@ jobs:
 
       - name: Deploy Pages
         id: deployment
-        uses: actions/deploy-pages@d0b8f8c8b73a74bb3078dc7b431b332a8c7790c7 # v4.0.5
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

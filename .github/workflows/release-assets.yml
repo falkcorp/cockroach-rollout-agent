@@ -1,5 +1,5 @@
 # file: .github/workflows/release-assets.yml
-# version: 1.2.0
+# version: 1.2.1
 # guid: 6ac4e69b-1c8d-4465-bb8d-d4b950850d0a
 
 name: Release Linux Assets
@@ -17,7 +17,6 @@ on:
 permissions:
   contents: write
   attestations: write
-  artifact-metadata: write
   id-token: write
 
 jobs:

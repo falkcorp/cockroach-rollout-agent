@@ -1,0 +1,10 @@
+# file: .github/actionlint.yaml
+# version: 1.0.0
+# guid: 841a5ce7-f307-45f6-9c38-19a839c1975d
+
+paths:
+  .github/workflows/coverage.yml:
+    ignore:
+      # GitHub Code Quality is in public preview; actionlint does not know this
+      # permission scope yet, but GitHub requires it for coverage uploads.
+      - 'unknown permission scope "code-quality"'
