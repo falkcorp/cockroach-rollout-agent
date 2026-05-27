@@ -1,5 +1,5 @@
 <!-- file: README.md -->
-<!-- version: 3.4.0 -->
+<!-- version: 3.5.0 -->
 <!-- guid: c68a62ce-72d1-45cc-a6c8-d3dfc41d0e34 -->
 <!-- last-edited: 2026-05-25 -->
 
@@ -67,9 +67,10 @@ curl -fsSL https://jdfalk.github.io/cockroach-rollout-agent/install.sh | sudo ba
 The installer downloads `SHA256SUMS` from the matching GitHub release and
 refuses to install if checksum validation fails.
 
-Release assets are also covered by GitHub build-provenance attestations. CI
-coverage is handled by the shared `jdfalk/ghcommon` reusable CI workflow using
-the Rust coverage configuration in `.github/repository-config.yml`.
+Release assets are also covered by GitHub build-provenance attestations through
+`actions/attest`. This repository does not use Codecov; Rust coverage is handled
+by the shared `jdfalk/ghcommon` reusable CI workflow using `cargo-llvm-cov` and
+the coverage configuration in `.github/repository-config.yml`.
 
 ## Runtime Configuration
 

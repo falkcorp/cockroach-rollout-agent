@@ -1,5 +1,5 @@
 # file: .github/workflows/release-assets.yml
-# version: 1.1.0
+# version: 1.2.0
 # guid: 6ac4e69b-1c8d-4465-bb8d-d4b950850d0a
 
 name: Release Linux Assets
@@ -17,6 +17,7 @@ on:
 permissions:
   contents: write
   attestations: write
+  artifact-metadata: write
   id-token: write
 
 jobs:
@@ -69,7 +70,7 @@ jobs:
             --clobber
 
       - name: Attest release assets
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
           subject-path: |
             dist/cockroach-rollout-agent-linux-amd64.tar.gz
