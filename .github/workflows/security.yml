@@ -1,0 +1,31 @@
+# file: .github/workflows/security.yml
+# version: 1.0.0
+# guid: e2897687-b991-4dd2-8fb3-e00e6b2ee1a8
+
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  pull-requests: read
+
+jobs:
+  advanced-security:
+    name: Advanced CodeQL Security
+    uses: jdfalk/ghcommon/.github/workflows/reusable-security.yml@main
+    with:
+      languages: '["rust", "actions"]'
+      skip-codeql: false
+      skip-dependency-review: false
+      skip-security-audit: false
+    secrets: inherit

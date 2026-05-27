@@ -1,5 +1,5 @@
 # file: .github/workflows/coverage.yml
-# version: 1.1.0
+# version: 1.1.2
 # guid: 4f094b99-d830-465a-b726-40ac118cd985
 
 name: Code Coverage
@@ -47,3 +47,5 @@ jobs:
           file: coverage.xml
           language: Rust
           label: code-coverage/cargo-llvm-cov
+          fail-on-error: false
+          token: ${{ github.token }}
