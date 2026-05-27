@@ -1,5 +1,5 @@
 # file: .github/workflows/coverage.yml
-# version: 1.0.1
+# version: 1.1.0
 # guid: 4f094b99-d830-465a-b726-40ac118cd985
 
 name: Code Coverage
@@ -28,7 +28,7 @@ jobs:
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@02be93da58aa71fb456aa9c43b301149248829d8 # v1.15.1
         with:
-          toolchain: "1.85"
+          toolchain: "1.87"
           components: llvm-tools-preview
           cache: true
 

@@ -10,7 +10,7 @@ repository = "https://github.com/jdfalk/cockroach-rollout-agent"
 readme = "README.md"
 keywords = ["cockroachdb", "rollout", "upgrade", "systemd"]
 categories = ["command-line-utilities"]
-rust-version = "1.85"
+rust-version = "1.87"
 
 [[bin]]
 name = "cockroach-rollout-agent"
