@@ -1,0 +1,77 @@
+# file: .github/workflows/release-assets.yml
+# version: 1.1.0
+# guid: 6ac4e69b-1c8d-4465-bb8d-d4b950850d0a
+
+name: Release Linux Assets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload assets to"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  attestations: write
+  id-token: write
+
+jobs:
+  linux-assets:
+    name: Build Linux Assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@02be93da58aa71fb456aa9c43b301149248829d8 # v1.15.1
+        with:
+          toolchain: "1.85"
+          target: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+          cache: true
+
+      - name: Install arm64 linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build amd64
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Build arm64
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+
+      - name: Package assets
+        run: |
+          mkdir -p dist/pkg
+          cp target/x86_64-unknown-linux-gnu/release/cockroach-rollout-agent dist/pkg/cockroach-rollout-agent
+          tar -C dist/pkg -czf dist/cockroach-rollout-agent-linux-amd64.tar.gz cockroach-rollout-agent
+          cp target/aarch64-unknown-linux-gnu/release/cockroach-rollout-agent dist/pkg/cockroach-rollout-agent
+          tar -C dist/pkg -czf dist/cockroach-rollout-agent-linux-arm64.tar.gz cockroach-rollout-agent
+          cd dist
+          sha256sum cockroach-rollout-agent-linux-amd64.tar.gz cockroach-rollout-agent-linux-arm64.tar.gz > SHA256SUMS
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          gh release upload "${RELEASE_TAG}" \
+            dist/cockroach-rollout-agent-linux-amd64.tar.gz \
+            dist/cockroach-rollout-agent-linux-arm64.tar.gz \
+            dist/SHA256SUMS \
+            --clobber
+
+      - name: Attest release assets
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            dist/cockroach-rollout-agent-linux-amd64.tar.gz
+            dist/cockroach-rollout-agent-linux-arm64.tar.gz
+            dist/SHA256SUMS

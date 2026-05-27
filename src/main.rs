@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 2.1.0
+// version: 2.2.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 
 use std::ffi::OsStr;
@@ -1477,17 +1477,11 @@ fn install_artifact(cli: &Cli, artifact: &Path) -> Result<(), AppError> {
     )?;
     let extracted = find_cockroach_binary(work_dir.path())?;
 
-    run_command(
-        "systemctl",
-        [OsStr::new("stop"), OsStr::new(&cli.service_name)],
-    )?;
+    run_systemctl("stop", &cli.service_name)?;
     fs::copy(&cli.binary_path, &backup_path)?;
     fs::copy(&extracted, &cli.binary_path)?;
     run_command("chmod", ["0755".as_ref(), cli.binary_path.as_os_str()])?;
-    run_command(
-        "systemctl",
-        [OsStr::new("start"), OsStr::new(&cli.service_name)],
-    )?;
+    run_systemctl("start", &cli.service_name)?;
 
     audit(
         cli,
@@ -1554,6 +1548,40 @@ where
             "{program} exited with status {status}"
         )))
     }
+}
+
+fn run_systemctl(action: &str, service_name: &str) -> Result<(), AppError> {
+    if command_status("systemctl", [OsStr::new(action), OsStr::new(service_name)])? {
+        return Ok(());
+    }
+
+    if command_status(
+        "sudo",
+        [
+            OsStr::new("-n"),
+            OsStr::new("systemctl"),
+            OsStr::new(action),
+            OsStr::new(service_name),
+        ],
+    )? {
+        return Ok(());
+    }
+
+    Err(AppError::Message(format!(
+        "failed to run systemctl {action} {service_name}; grant polkit access or install the sudoers fragment"
+    )))
+}
+
+fn command_status<I, S>(program: &str, args: I) -> Result<bool, AppError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let status = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .status()?;
+    Ok(status.success())
 }
 
 fn sha256_file(path: &Path) -> Result<(String, u64), AppError> {

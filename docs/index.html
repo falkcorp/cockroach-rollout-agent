@@ -1,0 +1,37 @@
+<!-- file: docs/index.html -->
+<!-- version: 1.0.0 -->
+<!-- guid: c20170c4-a13d-4a51-91a8-5f08986a8381 -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>cockroach-rollout-agent</title>
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        margin: 2rem auto;
+        max-width: 72rem;
+        padding: 0 1rem;
+        line-height: 1.5;
+      }
+      code,
+      pre {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      pre {
+        background: #f4f4f5;
+        overflow-x: auto;
+        padding: 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>cockroach-rollout-agent</h1>
+    <p>Linux installer for CockroachDB rollout agent.</p>
+    <pre><code>curl -fsSL https://jdfalk.github.io/cockroach-rollout-agent/install.sh | sudo bash</code></pre>
+    <p>With systemd files:</p>
+    <pre><code>curl -fsSL https://jdfalk.github.io/cockroach-rollout-agent/install.sh | sudo bash -s -- --with-systemd</code></pre>
+    <p><a href="https://github.com/jdfalk/cockroach-rollout-agent">GitHub repository</a></p>
+  </body>
+</html>

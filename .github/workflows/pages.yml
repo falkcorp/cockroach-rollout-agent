@@ -1,0 +1,56 @@
+# file: .github/workflows/pages.yml
+# version: 1.0.0
+# guid: 14d75f8c-45eb-46df-a445-f06f6b71ead4
+
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - scripts/install.sh
+      - examples/cockroach-rollout-agent.env.example
+      - examples/cockroach-rollout-agent.service
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy Pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Configure Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp docs/index.html _site/index.html
+          cp scripts/install.sh _site/install.sh
+          cp examples/cockroach-rollout-agent.service _site/cockroach-rollout-agent.service
+          cp examples/cockroach-rollout-agent.env.example _site/cockroach-rollout-agent.env.example
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
+        with:
+          path: _site
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@d0b8f8c8b73a74bb3078dc7b431b332a8c7790c7 # v4.0.5

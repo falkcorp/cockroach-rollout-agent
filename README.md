@@ -1,5 +1,5 @@
 <!-- file: README.md -->
-<!-- version: 3.2.0 -->
+<!-- version: 3.4.0 -->
 <!-- guid: c68a62ce-72d1-45cc-a6c8-d3dfc41d0e34 -->
 <!-- last-edited: 2026-05-25 -->
 
@@ -49,6 +49,27 @@ cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" init-db
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" discover
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" daemon --dry-run
 ```
+
+## Linux Self Install
+
+After a release publishes Linux assets, install the latest release with:
+
+```bash
+curl -fsSL https://jdfalk.github.io/cockroach-rollout-agent/install.sh | sudo bash
+```
+
+Install the binary plus systemd template files with:
+
+```bash
+curl -fsSL https://jdfalk.github.io/cockroach-rollout-agent/install.sh | sudo bash -s -- --with-systemd
+```
+
+The installer downloads `SHA256SUMS` from the matching GitHub release and
+refuses to install if checksum validation fails.
+
+Release assets are also covered by GitHub build-provenance attestations. CI
+coverage is handled by the shared `jdfalk/ghcommon` reusable CI workflow using
+the Rust coverage configuration in `.github/repository-config.yml`.
 
 ## Runtime Configuration
 
