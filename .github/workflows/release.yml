@@ -36,7 +36,7 @@ permissions:
 jobs:
   release:
     name: Reusable Release
-    uses: jdfalk/ghcommon/.github/workflows/reusable-release.yml@main
+    uses: falkcorp/github-common/.github/workflows/reusable-release.yml@main
     with:
       release-type: ${{ inputs.release-type || 'auto' }}
       build-target: rust
