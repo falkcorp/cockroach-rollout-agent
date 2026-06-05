@@ -17,7 +17,7 @@ permissions:
 jobs:
   ci:
     name: Reusable CI
-    uses: jdfalk/ghcommon/.github/workflows/reusable-ci.yml@main
+    uses: falkcorp/github-common/.github/workflows/reusable-ci.yml@main
     with:
       rust-version: stable
       skip-protobuf: true
