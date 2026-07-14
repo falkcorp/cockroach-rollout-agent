@@ -2,7 +2,7 @@
 # version: 1.0.0
 # guid: 38b97a89-8b2a-4885-a89e-20a9fa03d6b1
 
-FROM rust:1.96-bookworm AS builder
+FROM rust:1.97-bookworm AS builder
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
