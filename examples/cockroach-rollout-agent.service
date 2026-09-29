@@ -1,24 +1,31 @@
 # file: examples/cockroach-rollout-agent.service
-# version: 2.1.0
+# version: 3.0.0
 # guid: eaf842e1-7611-4539-848e-73b84ed31c7e
+
+# Replace @CROACH_ROLLOUT_SERVICE@ with this host's CockroachDB unit name.
+# It must match CROACH_ROLLOUT_SERVICE in the env file and the polkit rule.
+# scripts/install-rollout-agent.sh does the substitution.
 
 [Unit]
 Description=CockroachDB Rollout Agent
-After=network-online.target cockroachdb.service
+After=network-online.target @CROACH_ROLLOUT_SERVICE@
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=cockroach
 Group=cockroach
-EnvironmentFile=-/etc/cockroach-rollout-agent.env
+EnvironmentFile=/etc/cockroach-rollout-agent.env
 ExecStart=/usr/local/bin/cockroach-rollout-agent daemon
 Restart=on-failure
 RestartSec=10s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/var/log/cockroach-rollout-agent /var/lib/cockroach-rollout-agent /usr/local/bin/cockroach
+ProtectHome=true
+# Every agent write lands here. /usr/local/bin/cockroach is a root-owned
+# symlink into /var/lib/cockroach-rollout-agent/bin, so it stays read-only.
+ReadWritePaths=/var/log/cockroach-rollout-agent /var/lib/cockroach-rollout-agent
 
 [Install]
 WantedBy=multi-user.target

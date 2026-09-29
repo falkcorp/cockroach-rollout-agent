@@ -1,7 +1,7 @@
 <!-- file: README.md -->
-<!-- version: 3.7.0 -->
+<!-- version: 4.0.0 -->
 <!-- guid: c68a62ce-72d1-45cc-a6c8-d3dfc41d0e34 -->
-<!-- last-edited: 2026-07-28 -->
+<!-- last-edited: 2026-09-29 -->
 
 # cockroach-rollout-agent
 
@@ -23,13 +23,16 @@ target system, or a secret manager.
   binary endpoint.
 - Writes a JSON manifest containing artifact URLs, sizes, SHA-256 digests, and
   release-note scan results.
-- Provides a guarded local installer that validates the manifest, stops a
-  systemd service, backs up the current binary, replaces it, and starts the
-  service again.
+- Provides a guarded installer that validates the manifest, stages the new
+  binary, swaps it in atomically while the node is still running, restarts the
+  service, waits for the node to rejoin on the new build, and rolls back
+  automatically if it does not.
 - Writes append-only audit events with timestamps and action details.
 - Provides a polling daemon mode that can consume a manifest URL or file.
 - Provides a CockroachDB SQL coordination mode with leader election, cluster
-  discovery, manifest publication, agent heartbeats, and completion tracking.
+  discovery, operator-approved rollouts, one-node-at-a-time installs behind a
+  cluster health gate, and completion tracking from the cluster's own view of
+  each node's build.
 
 CockroachDB does not publish official ARMv6 Linux artifacts through the normal
 binary endpoint. The implementation targets `arm64`, which is the supported
@@ -48,6 +51,9 @@ cargo run -- daemon --manifest-url https://example.invalid/manifest.json --dry-r
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" init-db
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" discover
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" daemon --dry-run
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" status
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" approve v25.4.1
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" cancel --reason "..."
 ```
 
 ## Linux Self Install
@@ -58,7 +64,8 @@ After a release publishes Linux assets, install the latest release with:
 curl -fsSL https://jdfalk.github.io/cockroach-rollout-agent/install.sh | sudo bash
 ```
 
-Install the binary plus systemd template files with:
+Install the binary plus the per-host setup kit (then run the printed
+`install-rollout-agent.sh` command) with:
 
 ```bash
 curl -fsSL https://jdfalk.github.io/cockroach-rollout-agent/install.sh | sudo bash -s -- --with-systemd
@@ -82,8 +89,11 @@ Code Quality is enabled for the repository or account during the public preview.
 | `CROACH_ROLLOUT_GITHUB_API_URL` | `https://api.github.com/repos/cockroachdb/cockroach/tags?per_page=100` |
 | `CROACH_ROLLOUT_RELEASE_NOTES_BASE_URL` | `https://www.cockroachlabs.com/docs/releases` |
 | `CROACH_ROLLOUT_ARTIFACTS_DIR` | `dist` |
-| `CROACH_ROLLOUT_SERVICE` | `cockroachdb.service` |
+| `CROACH_ROLLOUT_SERVICE` | unset, required for installs (the unit name differs between hosts) |
 | `CROACH_ROLLOUT_BINARY_PATH` | `/usr/local/bin/cockroach` |
+| `CROACH_ROLLOUT_AGENT_ROOT` | `/var/lib/cockroach-rollout-agent` |
+| `CROACH_ROLLOUT_RESTART_TIMEOUT_SECONDS` | `600` |
+| `CROACH_ROLLOUT_AUTO_FINALIZE` | unset (operator runs `finalize`) |
 | `CROACH_ROLLOUT_AUDIT_LOG` | `/var/log/cockroach-rollout-agent/audit.log` |
 | `CROACH_ROLLOUT_DATABASE_URL` | unset |
 | `CROACH_ROLLOUT_SCHEMA` | `cockroach_rollout` |
@@ -115,14 +125,17 @@ The preferred production design is pull-based:
 2. Agents elect one rollout coordinator by acquiring a short-lived SQL lease in
    CockroachDB. This reuses CockroachDB's existing quorum and avoids
    unauthenticated LAN discovery.
-3. The coordinator creates the next-step manifest and publishes it in SQL.
-4. Agents read the manifest from SQL and download the official artifact over
-   HTTPS.
-5. Each agent validates the manifest, confirms the artifact digest, confirms
-   the manifest was prepared for the node's current binary version, verifies
-   release-note warning approval, stops only its local CockroachDB systemd
-   service, atomically replaces the binary, restarts the service, and records
-   audit events.
+3. The coordinator records the next release-line step as a **proposed**
+   rollout. Nothing installs until an operator runs `approve <version>`.
+4. Agents read the approved manifest from SQL and download the official
+   artifact over HTTPS.
+5. Agents take a cluster-wide install lease, so only one node upgrades at a
+   time, and proceed only when the cluster health gate passes. The agent
+   validates the artifact digest, stages the binary, swaps it in atomically
+   while the node is still running, restarts only its local CockroachDB unit,
+   and waits for the node to rejoin on the new build. If it does not, the
+   agent swaps the old binary back, restarts again, and marks the rollout
+   failed so no other node proceeds.
 6. After every node has rejoined the cluster on the new binary, patch upgrades
    are complete. Major-line upgrades must be finalized, either automatically by
    CockroachDB or manually with `finalize`.
@@ -162,15 +175,19 @@ cockroach-rollout-agent \
 
 Daemon behavior:
 
-- every agent heartbeats its local binary version into SQL;
+- every agent heartbeats its liveness and local binary version into SQL;
 - one agent becomes leader by holding a TTL lease row;
-- the leader discovers live CockroachDB nodes from
-  `crdb_internal.gossip_nodes`;
-- the leader publishes one active manifest for the next required release line;
-- followers download, validate, install, and report completion;
-- patch rollouts are marked finalized after every live node reports completion;
-- major-line rollouts wait for manual `finalize` unless the daemon is started
-  with `--auto-finalize`.
+- the leader proposes the next release-line step; `status` shows it and
+  `approve <version>` activates it;
+- approving a major-line step pins `cluster.preserve_downgrade_option`, so
+  CockroachDB cannot finalize on its own before an operator decides;
+- agents upgrade one at a time under an `install` lease, gated on cluster
+  health, with automatic rollback;
+- a rollout is complete when every non-decommissioned node is live and reports
+  the target build in `crdb_internal.gossip_nodes.build_tag`;
+- patch rollouts are then marked finalized; major-line rollouts wait for
+  `finalize` unless `--auto-finalize` is set;
+- a failed install halts the rollout until `cancel`.
 
 Discovery uses:
 
@@ -218,23 +235,18 @@ is authenticated and authorization is still anchored in the cluster lease.
 
 ## Local Permission Model
 
-Run the daemon as the `cockroach` user. Grant the minimum extra privileges:
+The daemon runs as the `cockroach` user with `NoNewPrivileges=true` and
+`ProtectSystem=strict`. It needs no root and no sudo:
 
-- permission to restart only the CockroachDB service;
-- write permission to the CockroachDB binary path or a controlled install
-  directory;
-- write permission to the audit log directory.
+- `/usr/local/bin/cockroach` is a root-owned symlink into
+  `/var/lib/cockroach-rollout-agent`, where the agent swaps a second symlink
+  between staged versions;
+- a polkit rule (`examples/50-cockroach-rollout-agent.rules`) allows only
+  start, stop, and restart of the one CockroachDB unit, for `cockroach` only;
+- the audit log and state directories are the only writable paths.
 
-Prefer a sudoers or polkit rule that permits only:
-
-```text
-/bin/systemctl stop cockroachdb.service
-/bin/systemctl start cockroachdb.service
-/bin/systemctl restart cockroachdb.service
-```
-
-If the binary path is root-owned, use a narrow ACL or install directory
-ownership policy instead of giving the daemon broad root access.
+`scripts/install-rollout-agent.sh` sets all of this up per host. See
+[Deployment](docs/deploy.md).
 
 ## Public Repository Safety
 

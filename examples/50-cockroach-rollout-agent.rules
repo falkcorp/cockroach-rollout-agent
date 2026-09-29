@@ -1,0 +1,33 @@
+// file: examples/50-cockroach-rollout-agent.rules
+// version: 1.0.0
+// guid: a6a245df-429e-4e36-ba74-4b6f0895d789
+// last-edited: 2026-09-29
+
+// Lets the `cockroach` user start, stop, and restart exactly one unit: the
+// CockroachDB service on this host. Nothing else is granted.
+//
+// Install as /etc/polkit-1/rules.d/50-cockroach-rollout-agent.rules (0644
+// root:root) after replacing @CROACH_ROLLOUT_SERVICE@ with this host's unit
+// name, which must equal CROACH_ROLLOUT_SERVICE in the env file.
+// scripts/install-rollout-agent.sh does the substitution.
+//
+// polkit is used instead of sudo because the agent unit sets
+// NoNewPrivileges=true, which makes setuid sudo fail. systemctl asks polkit
+// over D-Bus, which NoNewPrivileges does not affect.
+
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (subject.user !== "cockroach") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (action.lookup("unit") !== "@CROACH_ROLLOUT_SERVICE@") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var verb = action.lookup("verb");
+    if (verb === "start" || verb === "stop" || verb === "restart") {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});
