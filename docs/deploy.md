@@ -1,7 +1,7 @@
 <!-- file: docs/deploy.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 2.0.0 -->
 <!-- guid: 41eb3d6e-f70e-431d-8f3e-33d1ca5e45c1 -->
-<!-- last-edited: 2026-07-28 -->
+<!-- last-edited: 2026-09-29 -->
 
 # Deployment
 
@@ -17,104 +17,129 @@ sudo install -o root -g root -m 0755 \
   /usr/local/bin/cockroach-rollout-agent
 ```
 
-## 2. Configure Host Directories
+## 2. Permission Model
 
-```bash
-sudo install -o cockroach -g cockroach -m 0750 -d /var/lib/cockroach-rollout-agent
-sudo install -o cockroach -g cockroach -m 0750 -d /var/lib/cockroach-rollout-agent/artifacts
-sudo install -o cockroach -g cockroach -m 0750 -d /var/log/cockroach-rollout-agent
+The agent runs as `cockroach` and never needs root at runtime:
+
+```text
+/usr/local/bin/cockroach                        -> /var/lib/cockroach-rollout-agent/bin/cockroach  (root-owned, fixed)
+/var/lib/cockroach-rollout-agent/bin/cockroach  -> ../versions/cockroach-v25.3.0                   (agent swaps this)
+/var/lib/cockroach-rollout-agent/versions/cockroach-v25.3.0                                         (real binary)
 ```
 
-If `/usr/local/bin/cockroach` is root-owned, grant the narrowest practical write
-permission to the CockroachDB binary path or use a controlled install directory
-owned by `cockroach`.
+- **Binary swap:** the agent stages the new binary under `versions/` and
+  atomically renames `bin/cockroach` to point at it while CockroachDB is still
+  running. Only the restart causes downtime. If the node does not rejoin on the
+  new build within `CROACH_ROLLOUT_RESTART_TIMEOUT_SECONDS`, the link is
+  pointed back at the previous version and the unit is restarted again.
+- **Service control:** `examples/50-cockroach-rollout-agent.rules` is a polkit
+  rule allowing only `start`, `stop` and `restart` of the one CockroachDB unit,
+  and only for the `cockroach` user. sudo does not work here, because the agent
+  unit sets `NoNewPrivileges=true`.
+- **Unit name:** `CROACH_ROLLOUT_SERVICE` has no default, because the name
+  differs between hosts (`cockroach.service` on some, `cockroachdb.service` on
+  others). The env file, the agent unit's `After=`, and the polkit rule must
+  all name the same unit. The installer fills in all three from one value.
 
-## 3. Configure SQL Access
+## 3. SQL Identity
 
-Create a CockroachDB SQL user for rollout coordination and grant access to the
-database where the rollout schema will be created.
-
-Example shape:
+Create a dedicated user. Do **not** reuse the node certificate: it
+authenticates as `node`, which is effectively root.
 
 ```sql
 CREATE USER rollout;
 GRANT CREATE ON DATABASE defaultdb TO rollout;
-GRANT SELECT ON DATABASE defaultdb TO rollout;
+GRANT SYSTEM VIEWCLUSTERMETADATA TO rollout;   -- gossip_nodes, kv_store_status
+GRANT SYSTEM MODIFYCLUSTERSETTING TO rollout;  -- preserve_downgrade_option, finalize
 ```
 
-Use the certificate/authentication model already approved for your cluster.
-Store the connection string only on each host:
-
-```bash
-sudo install -o root -g cockroach -m 0640 \
-  examples/cockroach-rollout-agent.env.example \
-  /etc/cockroach-rollout-agent.env
-sudo editor /etc/cockroach-rollout-agent.env
-```
-
-Set `CROACH_ROLLOUT_DATABASE_URL` to a secure CockroachDB SQL URL.
-
-For a cluster with a private CA (the normal case), also set the TLS paths. They
-cannot travel in the URL — the `postgres` parser rejects `sslrootcert`,
-`sslcert`, and `sslkey`:
-
-```bash
-CROACH_ROLLOUT_DATABASE_URL=postgresql://rollout@<node-ip>:26257/defaultdb?sslmode=require
-CROACH_ROLLOUT_SSL_ROOT_CERT=/etc/cockroach-rollout-agent/certs/ca.crt
-CROACH_ROLLOUT_SSL_CLIENT_CERT=/etc/cockroach-rollout-agent/certs/client.rollout.crt
-CROACH_ROLLOUT_SSL_CLIENT_KEY=/etc/cockroach-rollout-agent/certs/client.rollout.pk8
-```
-
-Mint the client certificate and convert the key to PKCS#8, which is the only
-format the TLS layer accepts:
+Mint its certificate on the machine that holds the CA key:
 
 ```bash
 cockroach cert create-client rollout --certs-dir=certs --ca-key=my-safe-directory/ca.key
-openssl pkcs8 -topk8 -nocrypt -in certs/client.rollout.key -out certs/client.rollout.pk8
 ```
 
-Point each agent at its **own** node's SQL address so reporting status never
-depends on a peer being up.
+The installer converts the key to PKCS#8, which is the only format the TLS
+layer accepts. The `postgres` URL parser rejects `sslrootcert`, `sslcert` and
+`sslkey`, so the paths travel as `CROACH_ROLLOUT_SSL_*` variables instead.
 
-`CROACH_ROLLOUT_SERVICE` must name the CockroachDB unit **on that host**. The
-name is not always the same across a cluster, and the shipped
-`examples/cockroach-rollout-agent.service` and `.sudoers` both hardcode
-`cockroachdb.service` — substitute the real unit name in all three files.
+Point each agent at its **own** node's SQL address, so reporting status never
+depends on a peer being up and "is my node back?" asks the right node.
 
-## 4. Initialize Coordination Tables
+## 4. Install on Each Host
 
-Run once from any host:
+Copy the agent binary, `scripts/`, `examples/`, and a directory holding
+`ca.crt`, `client.rollout.crt` and `client.rollout.key` to the host. Then run
+as root:
 
 ```bash
-sudo -u cockroach /usr/local/bin/cockroach-rollout-agent \
-  --database-url "$CROACH_ROLLOUT_DATABASE_URL" \
-  init-db
+sudo scripts/install-rollout-agent.sh \
+  --agent-binary ./cockroach-rollout-agent \
+  --sql-addr <this-node-ip>:<sql-port> \
+  --certs-src ./certs
 ```
 
-Verify discovery:
+The script:
 
-```bash
-sudo -u cockroach /usr/local/bin/cockroach-rollout-agent \
-  --database-url "$CROACH_ROLLOUT_DATABASE_URL" \
-  discover
-```
+- detects the CockroachDB unit, or takes `--service`;
+- converts `/usr/local/bin/cockroach` to the layout above without restarting
+  CockroachDB, and verifies it still reports the same version afterwards;
+- writes the env file, the agent unit and the polkit rule;
+- runs `self-check` inside the unit's own sandbox;
+- leaves the agent **disabled** unless `--enable` is passed.
 
-## 5. Install Systemd Unit
+It is idempotent. `--uninstall` puts a real binary back at
+`/usr/local/bin/cockroach` and removes the unit and the polkit rule.
 
-```bash
-sudo install -o root -g root -m 0644 \
-  examples/cockroach-rollout-agent.service \
-  /etc/systemd/system/cockroach-rollout-agent.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now cockroach-rollout-agent.service
-```
+`self-check` verifies all of the following without stopping anything:
 
-Check logs:
+- the layout;
+- that the agent's directories are writable through the sandbox;
+- polkit restart authorization, probed with `pkcheck`;
+- SQL access.
 
-```bash
-journalctl -u cockroach-rollout-agent.service -f
-sudo tail -f /var/log/cockroach-rollout-agent/audit.log
-```
+Treat a failed self-check as a blocker.
+
+## 5. Run a Rollout
+
+1. **Enable the agent on every node.** A rollout cannot complete while any live
+   node lacks an agent.
+
+   ```bash
+   sudo systemctl enable --now cockroach-rollout-agent.service
+   ```
+
+2. **Review the proposal.** Within one tick, the leader records the next
+   release-line step as `proposed`.
+
+   ```bash
+   sudo -u cockroach env $(sudo cat /etc/cockroach-rollout-agent.env | xargs) \
+     cockroach-rollout-agent status
+   ```
+
+3. **Approve it.** Agents then upgrade one node at a time. Each waits for the
+   install lease and for the health gate.
+
+   ```bash
+   cockroach-rollout-agent approve v25.4.1
+   ```
+
+   If the release notes matched a warning pattern, read them first, then add
+   `--accept-release-note-warnings`.
+
+4. **Watch it.** Use `status`, `journalctl -u cockroach-rollout-agent -f`, and
+   `/var/log/cockroach-rollout-agent/audit.log`.
+
+5. **Finalize.** For a major-line step, once `status` shows every node on the
+   target, run `finalize --target-version v25.4.1`. Until you do,
+   `cluster.preserve_downgrade_option` keeps the cluster able to roll back.
+   After it, it cannot.
+
+- **Failed install:** a failed install rolls its own node back and marks the
+  rollout `failed`, which halts every other node. Investigate, then run
+  `cancel`.
+- **Cancel:** `cancel` works on a proposed or active rollout too. Nodes that
+  already upgraded stay upgraded.
 
 ## Docker
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # file: scripts/install.sh
-# version: 1.0.0
+# version: 2.0.0
 # guid: a57bc5a4-1b0d-491d-9fb5-b17a33a16f52
 
 set -euo pipefail
@@ -100,20 +100,22 @@ install_binary() {
   install -m 0755 "${source_binary}" "${install_dir}/${BINARY_NAME}"
 }
 
+# Installs the per-host setup kit rather than a ready-to-enable unit: the
+# unit, env file, and polkit rule all need this host's CockroachDB unit name
+# and SQL address, and the binary layout must be converted first.
 install_systemd_files() {
   require_command systemctl
-  install -d -m 0755 /etc/systemd/system
-  download "${PAGES_BASE_URL}/cockroach-rollout-agent.service" /etc/systemd/system/cockroach-rollout-agent.service
-
-  if [[ ! -f /etc/cockroach-rollout-agent.env ]]; then
-    download "${PAGES_BASE_URL}/cockroach-rollout-agent.env.example" /etc/cockroach-rollout-agent.env
-    chmod 0640 /etc/cockroach-rollout-agent.env
-  fi
-
-  install -d -o cockroach -g cockroach -m 0750 /var/lib/cockroach-rollout-agent /var/lib/cockroach-rollout-agent/artifacts /var/log/cockroach-rollout-agent
-  systemctl daemon-reload
-  echo "systemd files installed; edit /etc/cockroach-rollout-agent.env, then run:"
-  echo "  systemctl enable --now cockroach-rollout-agent.service"
+  local kit=/usr/local/share/cockroach-rollout-agent
+  install -d -m 0755 "${kit}/scripts" "${kit}/examples"
+  download "${PAGES_BASE_URL}/install-rollout-agent.sh" "${kit}/scripts/install-rollout-agent.sh"
+  chmod 0755 "${kit}/scripts/install-rollout-agent.sh"
+  local file
+  for file in cockroach-rollout-agent.service cockroach-rollout-agent.env.example 50-cockroach-rollout-agent.rules; do
+    download "${PAGES_BASE_URL}/${file}" "${kit}/examples/${file}"
+  done
+  echo "setup kit installed in ${kit}; finish with:"
+  echo "  sudo ${kit}/scripts/install-rollout-agent.sh --agent-binary ${install_dir}/${BINARY_NAME} \\"
+  echo "    --sql-addr <this-node-ip>:<sql-port> --certs-src <dir with ca.crt, client.rollout.crt, client.rollout.key>"
 }
 
 main() {
