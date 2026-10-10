@@ -1,5 +1,5 @@
 # file: .github/workflows/release.yml
-# version: 1.0.0
+# version: 1.1.0
 # guid: c25dc371-fc1b-4741-8cd1-2fb0046cb7b1
 
 name: Release
@@ -40,6 +40,19 @@ jobs:
     with:
       release-type: ${{ inputs.release-type || 'auto' }}
       build-target: rust
-      rust-enabled: true
+      # The shared Rust build attaches the whole cargo target/ directory as
+      # release assets (~500 .d/.rlib files, no binaries). Let it only cut the
+      # tag and release; the `assets` job below attaches the real artifacts.
+      disabled-languages: rust,docker
       stable: ${{ inputs.stable || false }}
     secrets: inherit
+
+  # A release created with GITHUB_TOKEN does not trigger `release: published`
+  # workflows, so release-assets.yml never ran on its own. Call it directly.
+  assets:
+    name: Release Linux Assets
+    needs: release
+    if: needs.release.outputs.release-created == 'true' && needs.release.outputs.release-tag != ''
+    uses: ./.github/workflows/release-assets.yml
+    with:
+      tag: ${{ needs.release.outputs.release-tag }}
