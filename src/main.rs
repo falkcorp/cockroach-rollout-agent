@@ -2100,8 +2100,10 @@ fn service_exec_path(service: &str) -> Result<PathBuf, String> {
 /// Parses `systemctl show --property=ExecStart --value` output, which holds
 /// one `{ path=... ; argv[]=... ; ... }` group per `ExecStart=` line.
 fn parse_exec_start_path(output: &str) -> Result<PathBuf, String> {
+    // Split on the group opener, not bare `path=`: arguments such as
+    // `--store=path=/mnt/data` contain it too.
     let paths: Vec<&str> = output
-        .split("path=")
+        .split("{ path=")
         .skip(1)
         .filter_map(|rest| rest.split(" ;").next())
         .map(str::trim)
@@ -2531,6 +2533,12 @@ mod tests {
             PathBuf::from("/var/lib/cockroach-rollout-agent/bin/cockroach")
         );
         assert!(parse_exec_start_path("").is_err(), "no ExecStart");
+        let store = "{ path=/var/lib/cockroach-rollout-agent/bin/cockroach ; argv[]=/var/lib/cockroach-rollout-agent/bin/cockroach start --store=path=/var/lib/cockroach,attrs=ssd ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n";
+        assert_eq!(
+            parse_exec_start_path(store).unwrap(),
+            PathBuf::from("/var/lib/cockroach-rollout-agent/bin/cockroach"),
+            "--store=path= inside argv is not a second ExecStart"
+        );
         let two = format!("{one}{one}");
         assert!(parse_exec_start_path(&two).is_err(), "two ExecStart lines");
     }

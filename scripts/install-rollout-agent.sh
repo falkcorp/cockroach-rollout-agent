@@ -167,6 +167,12 @@ exec_argv() {
 # rerun the previous drop-in stays in place until the new one is verified.
 write_exec_dropin() {
     local exec rest before after previous="" tmp
+    # Only safe while the unit itself runs as the agent user: anyone else,
+    # root included, would execute a binary the agent user can replace.
+    local unit_user
+    unit_user=$(systemctl show --property=User --value "$service")
+    [[ $unit_user == "$AGENT_USER" ]] ||
+        die "$service runs as '${unit_user:-root}', not $AGENT_USER; refusing to point it at an agent-writable binary"
     exec=$(current_exec_start) || die "$service must have exactly one ExecStart"
     rest=${exec#"$SYSTEM_BINARY"}
     [[ $rest != "$exec" && ( -z $rest || $rest == [[:space:]]* ) ]] ||
@@ -247,17 +253,19 @@ log "creating directories"
 install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0750 "$AGENT_ROOT" "$LOG_DIR"
 as_agent mkdir -p -m 0750 "$AGENT_ROOT/bin" "$AGENT_ROOT/versions" "$AGENT_ROOT/artifacts"
 install -d -o root -g root -m 0755 /etc/cockroach-rollout-agent
-install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$CERTS_DIR"
+# Root-owned so root never writes into a directory the agent user controls;
+# the agent only reads these.
+install -d -o root -g "$AGENT_USER" -m 0750 "$CERTS_DIR"
 
 log "installing client certificate"
-install -o "$AGENT_USER" -g "$AGENT_USER" -m 0644 "$certs_src/ca.crt" "$CERTS_DIR/ca.crt"
-install -o "$AGENT_USER" -g "$AGENT_USER" -m 0644 "$certs_src/client.rollout.crt" \
+install -o root -g "$AGENT_USER" -m 0644 "$certs_src/ca.crt" "$CERTS_DIR/ca.crt"
+install -o root -g "$AGENT_USER" -m 0644 "$certs_src/client.rollout.crt" \
     "$CERTS_DIR/client.rollout.crt"
 key_tmp=$(mktemp "$CERTS_DIR/.key.XXXXXX")
 # `openssl pkey` writes PKCS#8 whether the input is PKCS#1 or PKCS#8.
 openssl pkey -in "$certs_src/client.rollout.key" -out "$key_tmp"
-chown "$AGENT_USER:$AGENT_USER" "$key_tmp"
-chmod 0600 "$key_tmp"
+chown "root:$AGENT_USER" "$key_tmp"
+chmod 0640 "$key_tmp"
 mv -f "$key_tmp" "$CERTS_DIR/client.rollout.pk8"
 
 stage_current_binary
