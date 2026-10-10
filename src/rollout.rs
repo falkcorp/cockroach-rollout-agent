@@ -1,7 +1,7 @@
 // file: src/rollout.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: ceae8795-4955-43fe-9829-2f28332e8005
-// last-edited: 2026-09-29
+// last-edited: 2026-10-10
 
 //! Pure rollout decisions, kept free of SQL and I/O so they can be unit tested.
 
@@ -82,6 +82,41 @@ pub fn all_nodes_on(target: &Version, nodes: &[NodeObservation]) -> bool {
         && nodes
             .iter()
             .all(|node| node.is_live && node.version.as_ref() == Some(target))
+}
+
+/// The oldest and newest build across active members.
+///
+/// A settled cluster reports one version, so both are equal. A cluster left
+/// partway through an upgrade, for example by a hand-upgraded node, reports
+/// two, and the leader may resume from the older one. Errors explain why no
+/// proposal can be made, for the audit log.
+pub fn live_version_span(nodes: &[NodeObservation]) -> Result<(Version, Version), String> {
+    if nodes.is_empty() {
+        return Err("no active cluster members observed".to_string());
+    }
+    let mut versions = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        if !node.is_live {
+            return Err(format!("node {} is not live", node.node_id));
+        }
+        let Some(version) = node.version.clone() else {
+            return Err(format!(
+                "node {} reports an unparseable build",
+                node.node_id
+            ));
+        };
+        versions.push(version);
+    }
+    versions.sort();
+    versions.dedup();
+    match versions.as_slice() {
+        [only] => Ok((only.clone(), only.clone())),
+        [oldest, newest] => Ok((oldest.clone(), newest.clone())),
+        _ => Err(format!(
+            "nodes run {} different versions; at most two (one upgrade step) can be resumed",
+            versions.len()
+        )),
+    }
 }
 
 /// What the leader should do with the newest open rollout.
@@ -175,6 +210,44 @@ mod tests {
             assert_eq!(status.as_str().parse::<RolloutStatus>(), Ok(status));
         }
         assert!("bogus".parse::<RolloutStatus>().is_err());
+    }
+
+    #[test]
+    fn version_span_covers_settled_and_partial_clusters() {
+        let settled = [node(1, true, "25.3.0"), node(2, true, "25.3.0")];
+        assert_eq!(
+            live_version_span(&settled).unwrap(),
+            (version("25.3.0"), version("25.3.0"))
+        );
+
+        let partial = [
+            node(1, true, "25.4.17"),
+            node(2, true, "25.3.0"),
+            node(3, true, "25.3.0"),
+        ];
+        assert_eq!(
+            live_version_span(&partial).unwrap(),
+            (version("25.3.0"), version("25.4.17"))
+        );
+
+        assert!(live_version_span(&[]).is_err(), "no nodes");
+        assert!(
+            live_version_span(&[node(1, true, "25.3.0"), node(2, false, "25.3.0")]).is_err(),
+            "a dead node blocks proposals"
+        );
+        assert!(
+            live_version_span(&[node(1, true, "25.3.0"), node(2, true, "garbage")]).is_err(),
+            "an unparseable build blocks proposals"
+        );
+        assert!(
+            live_version_span(&[
+                node(1, true, "25.2.9"),
+                node(2, true, "25.3.0"),
+                node(3, true, "25.4.17"),
+            ])
+            .is_err(),
+            "three versions is more than one step"
+        );
     }
 
     #[test]
