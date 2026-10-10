@@ -1,7 +1,7 @@
 <!-- file: docs/deploy.md -->
-<!-- version: 2.0.0 -->
+<!-- version: 2.1.0 -->
 <!-- guid: 41eb3d6e-f70e-431d-8f3e-33d1ca5e45c1 -->
-<!-- last-edited: 2026-09-29 -->
+<!-- last-edited: 2026-10-10 -->
 
 # Deployment
 
@@ -22,10 +22,18 @@ sudo install -o root -g root -m 0755 \
 The agent runs as `cockroach` and never needs root at runtime:
 
 ```text
-/usr/local/bin/cockroach                        -> /var/lib/cockroach-rollout-agent/bin/cockroach  (root-owned, fixed)
-/var/lib/cockroach-rollout-agent/bin/cockroach  -> ../versions/cockroach-v25.3.0                   (agent swaps this)
-/var/lib/cockroach-rollout-agent/versions/cockroach-v25.3.0                                         (real binary)
+/etc/systemd/system/<unit>.d/50-cockroach-rollout-agent.conf   ExecStart= -> /var/lib/cockroach-rollout-agent/bin/cockroach
+/var/lib/cockroach-rollout-agent/bin/cockroach  -> ../versions/cockroach-v25.3.0   (agent swaps this)
+/var/lib/cockroach-rollout-agent/versions/cockroach-v25.3.0                         (real binary)
+/usr/local/bin/cockroach                                                            (root-owned copy, CLI only)
 ```
+
+- **Root never runs agent-writable code:** the `cockroach` user can replace
+  anything under `/var/lib/cockroach-rollout-agent`, so only the CockroachDB
+  unit, which already runs as `cockroach`, executes from there. Operators keep
+  using `/usr/local/bin/cockroach`, a root-owned file the agent never writes.
+  After a rollout it lags the server; install the matching official binary
+  there when convenient. Do not run anything under the agent root as root.
 
 - **Binary swap:** the agent stages the new binary under `versions/` and
   atomically renames `bin/cockroach` to point at it while CockroachDB is still
@@ -82,18 +90,23 @@ sudo scripts/install-rollout-agent.sh \
 The script:
 
 - detects the CockroachDB unit, or takes `--service`;
-- converts `/usr/local/bin/cockroach` to the layout above without restarting
-  CockroachDB, and verifies it still reports the same version afterwards;
+- stages the running `/usr/local/bin/cockroach` version under `versions/`,
+  doing every write inside the agent root as `cockroach`, never as root;
+- adds the `ExecStart` drop-in and checks with `systemctl show` that only the
+  executable changed. It takes effect at the unit's next restart, so
+  CockroachDB is not restarted;
 - writes the env file, the agent unit and the polkit rule;
 - runs `self-check` inside the unit's own sandbox;
 - leaves the agent **disabled** unless `--enable` is passed.
 
-It is idempotent. `--uninstall` puts a real binary back at
-`/usr/local/bin/cockroach` and removes the unit and the polkit rule.
+It is idempotent. `--uninstall` removes the drop-in, the unit and the polkit
+rule. It refuses while `/usr/local/bin/cockroach` is a different version than
+the agent-managed binary, because the next restart would silently switch
+versions; install the matching official binary there first.
 
 `self-check` verifies all of the following without stopping anything:
 
-- the layout;
+- that the CockroachDB unit's `ExecStart` runs the agent link, which resolves;
 - that the agent's directories are writable through the sandbox;
 - polkit restart authorization, probed with `pkcheck`;
 - SQL access.

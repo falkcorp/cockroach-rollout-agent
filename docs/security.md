@@ -1,7 +1,7 @@
 <!-- file: docs/security.md -->
-<!-- version: 2.1.0 -->
+<!-- version: 2.2.0 -->
 <!-- guid: b1107208-a9c3-4018-9e86-a44cbf5c7f79 -->
-<!-- last-edited: 2026-09-29 -->
+<!-- last-edited: 2026-10-10 -->
 
 # Security Model
 
@@ -31,8 +31,12 @@ The rollout agent must be treated as privileged infrastructure automation.
 - The daemon runs as `cockroach`, not root, with `NoNewPrivileges=true` and
   `ProtectSystem=strict`. Its only writable paths are its own state and log
   directories.
-- It never writes to `/usr/local/bin`. That path is a root-owned symlink into
-  the agent's own directory, and the agent swaps a second symlink inside it.
+- It never writes to `/usr/local/bin`. The CockroachDB unit runs the
+  agent-managed `/var/lib/cockroach-rollout-agent/bin/cockroach` through an
+  `ExecStart` drop-in. `/usr/local/bin/cockroach` stays a separate root-owned
+  file, so root never executes a binary the `cockroach` user can replace. The
+  installer runs every command inside the agent root as `cockroach` and never
+  follows links there as root.
 - Service control is a polkit rule allowing only start, stop, and restart of
   the one CockroachDB unit, for the `cockroach` user only. There is no sudo
   grant.

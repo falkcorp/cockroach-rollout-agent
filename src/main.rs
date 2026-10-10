@@ -1,7 +1,7 @@
 // file: src/main.rs
-// version: 3.0.0
+// version: 3.1.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
-// last-edited: 2026-09-29
+// last-edited: 2026-10-10
 
 mod health;
 mod layout;
@@ -37,7 +37,6 @@ const DEFAULT_GITHUB_API_URL: &str =
     "https://api.github.com/repos/cockroachdb/cockroach/tags?per_page=100";
 const DEFAULT_RELEASE_NOTES_BASE_URL: &str = "https://www.cockroachlabs.com/docs/releases";
 const DEFAULT_ARTIFACTS_DIR: &str = "dist";
-const DEFAULT_BINARY_PATH: &str = "/usr/local/bin/cockroach";
 const DEFAULT_AUDIT_LOG: &str = "/var/log/cockroach-rollout-agent/audit.log";
 const DEFAULT_MANIFEST_PATH: &str = "dist/manifest.json";
 const DEFAULT_DAEMON_INTERVAL_SECONDS: u64 = 300;
@@ -102,8 +101,8 @@ struct Cli {
     #[arg(long, env = "CROACH_ROLLOUT_SERVICE")]
     service_name: Option<String>,
 
-    /// Agent-owned directory holding `bin/cockroach` and `versions/`.
-    /// `--binary-path` must be a symlink to `<agent-root>/bin/cockroach`.
+    /// Agent-owned directory holding `bin/cockroach` and `versions/`. The
+    /// CockroachDB unit's `ExecStart` must run `<agent-root>/bin/cockroach`.
     #[arg(long, env = "CROACH_ROLLOUT_AGENT_ROOT", default_value = DEFAULT_AGENT_ROOT)]
     agent_root: PathBuf,
 
@@ -116,12 +115,11 @@ struct Cli {
     )]
     restart_timeout_seconds: u64,
 
-    #[arg(
-        long,
-        env = "CROACH_ROLLOUT_BINARY_PATH",
-        default_value = DEFAULT_BINARY_PATH
-    )]
-    binary_path: PathBuf,
+    /// CockroachDB binary whose version counts as installed. Defaults to
+    /// `<agent-root>/bin/cockroach`; override only on hosts without the
+    /// agent layout, for example when running `plan` from a workstation.
+    #[arg(long, env = "CROACH_ROLLOUT_BINARY_PATH")]
+    binary_path: Option<PathBuf>,
 
     #[arg(long, env = "CROACH_ROLLOUT_AUDIT_LOG", default_value = DEFAULT_AUDIT_LOG)]
     audit_log: PathBuf,
@@ -507,7 +505,7 @@ fn next_upgrade_plan(
 ) -> Result<Option<UpgradePlan>, AppError> {
     let current = match current_version {
         Some(version) => parse_cockroach_version(version)?,
-        None => installed_cockroach_version(&cli.binary_path)?,
+        None => installed_cockroach_version(&cockroach_binary(cli))?,
     };
     let available_versions = available_cockroach_versions(&cli.github_api_url)?;
     let latest = available_versions
@@ -552,7 +550,7 @@ fn install_command(
     dry_run: bool,
 ) -> Result<(), AppError> {
     let manifest: RolloutManifest = read_json_file(manifest_path)?;
-    let current = installed_cockroach_version(&cli.binary_path)?;
+    let current = installed_cockroach_version(&cockroach_binary(cli))?;
     validate_manifest_current_version(&current, &manifest)?;
 
     if !manifest.release_note_warnings.is_empty() && !manifest.release_note_warnings_approved {
@@ -697,7 +695,7 @@ fn db_daemon_tick(
     dry_run: bool,
     auto_finalize: bool,
 ) -> Result<(), AppError> {
-    let installed = installed_cockroach_version(&cli.binary_path)?;
+    let installed = installed_cockroach_version(&cockroach_binary(cli))?;
 
     if dry_run {
         let holder = lease_holder(cli, client, LEADER_LEASE)?;
@@ -1029,7 +1027,7 @@ impl HealthWaiter for UnitHealthWaiter<'_> {
         while SystemTime::now() < deadline {
             thread::sleep(Duration::from_secs(HEALTH_POLL_SECONDS));
             let active = command_status("systemctl", ["is-active", "--quiet", service])?;
-            if active && installed_cockroach_version(&self.cli.binary_path)? == *expected {
+            if active && installed_cockroach_version(&cockroach_binary(self.cli))? == *expected {
                 return Ok(());
             }
         }
@@ -1051,10 +1049,10 @@ fn upgrade_node(
     waiter: &dyn HealthWaiter,
 ) -> Result<(), AppError> {
     let layout = BinaryLayout::new(&cli.agent_root);
-    layout
-        .verify_wired(&cli.binary_path)
-        .map_err(AppError::Message)?;
     let service = service_name(cli)?;
+    layout
+        .verify_wired(&service_exec_path(service).map_err(AppError::Message)?)
+        .map_err(AppError::Message)?;
     let from = &manifest.current_version;
     let target = &manifest.target_version;
 
@@ -1925,16 +1923,16 @@ fn self_check_command(cli: &Cli) -> Result<(), AppError> {
     check("service name", service.clone().map(str::to_string));
 
     let layout = BinaryLayout::new(&cli.agent_root);
-    check(
-        "binary layout",
-        layout.verify_wired(&cli.binary_path).map(|()| {
-            format!(
-                "{} -> {}",
-                cli.binary_path.display(),
-                layout.current_link().display()
-            )
-        }),
-    );
+    if let Ok(service) = &service {
+        check(
+            "binary layout",
+            service_exec_path(service).and_then(|exec_path| {
+                layout
+                    .verify_wired(&exec_path)
+                    .map(|()| format!("{service} runs {}", layout.current_link().display()))
+            }),
+        );
+    }
     for dir in [
         layout.bin_dir(),
         layout.versions_dir(),
@@ -1947,7 +1945,7 @@ fn self_check_command(cli: &Cli) -> Result<(), AppError> {
     }
     check(
         "installed version",
-        installed_cockroach_version(&cli.binary_path)
+        installed_cockroach_version(&cockroach_binary(cli))
             .map(|version| version.to_string())
             .map_err(|error| error.to_string()),
     );
@@ -2071,6 +2069,50 @@ fn paginated_url(base: &str, page: u16) -> String {
         format!("{base}&page={page}")
     } else {
         format!("{base}?page={page}")
+    }
+}
+
+/// The binary the agent reads the installed version from.
+fn cockroach_binary(cli: &Cli) -> PathBuf {
+    cli.binary_path
+        .clone()
+        .unwrap_or_else(|| BinaryLayout::new(&cli.agent_root).current_link())
+}
+
+/// Returns the executable `service`'s `ExecStart` runs, as systemd will
+/// start it after the next restart (drop-ins included).
+fn service_exec_path(service: &str) -> Result<PathBuf, String> {
+    let output = Command::new("systemctl")
+        .args(["show", "--property=ExecStart", "--value", service])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not run systemctl show: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl show {service} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_exec_start_path(&String::from_utf8_lossy(&output.stdout))
+        .map_err(|error| format!("{service}: {error}"))
+}
+
+/// Parses `systemctl show --property=ExecStart --value` output, which holds
+/// one `{ path=... ; argv[]=... ; ... }` group per `ExecStart=` line.
+fn parse_exec_start_path(output: &str) -> Result<PathBuf, String> {
+    let paths: Vec<&str> = output
+        .split("path=")
+        .skip(1)
+        .filter_map(|rest| rest.split(" ;").next())
+        .map(str::trim)
+        .collect();
+    match paths.as_slice() {
+        [path] if !path.is_empty() => Ok(PathBuf::from(path)),
+        [] | [_] => Err("has no ExecStart".to_string()),
+        _ => Err(format!(
+            "has {} ExecStart lines; expected exactly one",
+            paths.len()
+        )),
     }
 }
 
@@ -2480,6 +2522,18 @@ fn unix_time() -> Result<u64, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_start_path_is_parsed_from_systemctl_show() {
+        let one = "{ path=/var/lib/cockroach-rollout-agent/bin/cockroach ; argv[]=/var/lib/cockroach-rollout-agent/bin/cockroach start --certs-dir=/certs ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n";
+        assert_eq!(
+            parse_exec_start_path(one).unwrap(),
+            PathBuf::from("/var/lib/cockroach-rollout-agent/bin/cockroach")
+        );
+        assert!(parse_exec_start_path("").is_err(), "no ExecStart");
+        let two = format!("{one}{one}");
+        assert!(parse_exec_start_path(&two).is_err(), "two ExecStart lines");
+    }
 
     #[test]
     fn parse_version_from_tag() {

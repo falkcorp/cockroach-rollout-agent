@@ -1,15 +1,19 @@
 // file: src/layout.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 38e9eb5d-1113-4a32-b8ef-45ade70b5c39
-// last-edited: 2026-09-29
+// last-edited: 2026-10-10
 
 //! Agent-owned CockroachDB binary layout.
 //!
 //! ```text
-//! /usr/local/bin/cockroach            -> <root>/bin/cockroach          (root-owned, never changes)
 //! <root>/bin/cockroach                -> ../versions/cockroach-v25.3.0 (swapped atomically by the agent)
 //! <root>/versions/cockroach-v25.3.0                                    (real executable)
 //! ```
+//!
+//! The CockroachDB unit runs `<root>/bin/cockroach` through a systemd
+//! drop-in that overrides `ExecStart`. `/usr/local/bin/cockroach` stays a
+//! separate root-owned copy for operators. Root must never execute anything
+//! under `<root>`, because the `cockroach` user can replace it.
 //!
 //! Every write the agent makes lands under `<root>`, which the `cockroach`
 //! user owns, so the service can keep `NoNewPrivileges` and
@@ -89,20 +93,14 @@ impl BinaryLayout {
             })
     }
 
-    /// Checks that `system_binary` is a symlink to this layout's current link
-    /// and that the current link resolves to a file under `versions/`.
-    pub fn verify_wired(&self, system_binary: &Path) -> Result<(), String> {
-        let system_target = fs::read_link(system_binary).map_err(|error| {
-            format!(
-                "{} is not a symlink into the agent layout ({error}); run install-rollout-agent.sh to convert it",
-                system_binary.display()
-            )
-        })?;
-        if system_target != self.current_link() {
+    /// Checks that `exec_path`, the executable the CockroachDB unit starts,
+    /// is this layout's current link, and that the link resolves to a file
+    /// under `versions/`.
+    pub fn verify_wired(&self, exec_path: &Path) -> Result<(), String> {
+        if exec_path != self.current_link() {
             return Err(format!(
-                "{} points at {}, expected {}",
-                system_binary.display(),
-                system_target.display(),
+                "the CockroachDB unit runs {}, expected {}; run install-rollout-agent.sh to add the ExecStart drop-in",
+                exec_path.display(),
                 self.current_link().display()
             ));
         }
@@ -283,21 +281,21 @@ mod tests {
         layout.stage(&source, &version("25.3.0")).unwrap();
         layout.activate(&version("25.3.0")).unwrap();
 
-        let system = scratch.path().join("usr-local-bin-cockroach");
         assert!(
-            layout.verify_wired(&system).is_err(),
-            "missing link must fail"
+            layout
+                .verify_wired(Path::new("/usr/local/bin/cockroach"))
+                .is_err(),
+            "unit running the system binary must fail"
         );
+        layout
+            .verify_wired(&layout.current_link())
+            .expect("unit running the agent link passes");
 
-        fs::copy(&source, &system).unwrap();
+        fs::remove_file(layout.version_path(&version("25.3.0"))).unwrap();
         assert!(
-            layout.verify_wired(&system).is_err(),
-            "plain file must fail"
+            layout.verify_wired(&layout.current_link()).is_err(),
+            "dangling agent link must fail"
         );
-
-        fs::remove_file(&system).unwrap();
-        symlink(layout.current_link(), &system).unwrap();
-        layout.verify_wired(&system).expect("wired layout passes");
     }
 
     #[test]

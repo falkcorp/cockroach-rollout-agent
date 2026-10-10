@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 # file: scripts/install-rollout-agent.sh
-# version: 1.0.0
+# version: 2.0.0
 # guid: 963803cf-366e-40c7-bc9a-67bcd54597a9
-# last-edited: 2026-09-29
+# last-edited: 2026-10-10
 #
-# Installs or updates cockroach-rollout-agent on one CockroachDB host, and
-# converts /usr/local/bin/cockroach to the agent-owned symlink layout.
-# Idempotent: safe to rerun. Never starts, stops, or restarts CockroachDB,
-# and leaves the agent disabled unless --enable is given.
+# Installs or updates cockroach-rollout-agent on one CockroachDB host. Stages
+# the running CockroachDB version under the agent root and adds a systemd
+# drop-in so the CockroachDB unit runs the agent-managed binary from its next
+# restart on. /usr/local/bin/cockroach stays a root-owned file the agent never
+# touches. Idempotent: safe to rerun. Never starts, stops, or restarts
+# CockroachDB, and leaves the agent disabled unless --enable is given.
+#
+# Root never executes or follows links under the agent root: the cockroach
+# user can rewrite anything there. Every command that touches it runs as
+# that user.
 #
 # Usage (as root, from a directory holding this script's repo layout):
 #   install-rollout-agent.sh --agent-binary PATH --sql-addr HOST:PORT \
@@ -27,6 +33,8 @@ ENV_FILE=/etc/cockroach-rollout-agent.env
 UNIT_FILE=/etc/systemd/system/cockroach-rollout-agent.service
 POLKIT_FILE=/etc/polkit-1/rules.d/50-cockroach-rollout-agent.rules
 SYSTEM_BINARY=/usr/local/bin/cockroach
+AGENT_LINK=${AGENT_ROOT}/bin/cockroach
+DROPIN_NAME=50-cockroach-rollout-agent.conf
 AGENT_BINARY=/usr/local/bin/cockroach-rollout-agent
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -44,6 +52,7 @@ die() {
     exit 1
 }
 log() { echo "==> $*"; }
+as_agent() { runuser -u "$AGENT_USER" -- "$@"; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -88,59 +97,133 @@ render() {
     mv -f "$tmp" "$dest"
 }
 
-# Points $SYSTEM_BINARY at the agent layout without ever leaving the path
-# missing: the new link is created beside it and renamed over it.
-convert_binary_layout() {
-    local link="${AGENT_ROOT}/bin/cockroach"
-    if [[ -L $SYSTEM_BINARY && $(readlink "$SYSTEM_BINARY") == "$link" ]]; then
-        log "binary layout already converted"
-        return
-    fi
+# The operator-facing binary must be a real root-owned file: root runs it.
+require_root_owned_system_binary() {
     [[ -f $SYSTEM_BINARY && ! -L $SYSTEM_BINARY ]] ||
-        die "$SYSTEM_BINARY is neither a regular file nor our symlink; fix by hand"
-
-    local tag version staged
-    tag=$("$SYSTEM_BINARY" version --build-tag)
-    version=${tag#v}
-    staged="${AGENT_ROOT}/versions/cockroach-v${version}"
-    log "staging current binary ${tag} as ${staged}"
-    install -o "$AGENT_USER" -g "$AGENT_USER" -m 0755 "$SYSTEM_BINARY" "${staged}.partial"
-    mv -f "${staged}.partial" "$staged"
-    [[ $("$staged" version --build-tag) == "$tag" ]] || die "staged copy does not report $tag"
-
-    ln -sfn "../versions/cockroach-v${version}" "${AGENT_ROOT}/bin/.cockroach.next"
-    chown -h "$AGENT_USER:$AGENT_USER" "${AGENT_ROOT}/bin/.cockroach.next"
-    mv -Tf "${AGENT_ROOT}/bin/.cockroach.next" "$link"
-
-    # Keep the original until the rename succeeds, then replace it atomically.
-    ln -sfn "$link" "${SYSTEM_BINARY}.rollout-next"
-    mv -Tf "${SYSTEM_BINARY}.rollout-next" "$SYSTEM_BINARY"
-    [[ $("$SYSTEM_BINARY" version --build-tag) == "$tag" ]] ||
-        die "$SYSTEM_BINARY no longer reports $tag after conversion"
-    log "$SYSTEM_BINARY -> $link -> cockroach-v${version}"
+        die "$SYSTEM_BINARY must be a regular file; if an older installer made it a symlink, install the official cockroach binary there and rerun"
+    [[ $(stat -c %u "$SYSTEM_BINARY") == 0 ]] || die "$SYSTEM_BINARY is not owned by root"
 }
 
-# Restores $SYSTEM_BINARY as a real root-owned file holding whatever version
-# is currently active.
-revert_binary_layout() {
-    if [[ ! -L $SYSTEM_BINARY ]]; then
-        log "$SYSTEM_BINARY is already a regular file"
+# Copies the running version into versions/ and, on first install, points
+# bin/cockroach at it. An existing bin/cockroach belongs to the agent and is
+# left alone.
+stage_current_binary() {
+    require_root_owned_system_binary
+    local tag version name staged
+    tag=$(as_agent "$SYSTEM_BINARY" version --build-tag)
+    version=${tag#v}
+    [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$ ]] ||
+        die "unexpected build tag from $SYSTEM_BINARY: $tag"
+    name="cockroach-v${version}"
+    staged="${AGENT_ROOT}/versions/${name}"
+
+    if ! as_agent test -f "$staged"; then
+        log "staging ${tag} as ${staged}"
+        as_agent install -m 0755 "$SYSTEM_BINARY" "${AGENT_ROOT}/versions/.${name}.partial"
+        as_agent mv -f "${AGENT_ROOT}/versions/.${name}.partial" "$staged"
+    fi
+    [[ $(as_agent "$staged" version --build-tag) == "$tag" ]] ||
+        die "staged copy $staged does not report $tag"
+
+    if as_agent test -L "$AGENT_LINK"; then
+        log "$AGENT_LINK already exists; leaving it to the agent"
+    else
+        as_agent ln -sfn "../versions/${name}" "${AGENT_ROOT}/bin/.cockroach.next"
+        as_agent mv -Tf "${AGENT_ROOT}/bin/.cockroach.next" "$AGENT_LINK"
+        log "$AGENT_LINK -> ../versions/${name}"
+    fi
+}
+
+# Prints the unit's one effective ExecStart= value, backslash continuations
+# kept verbatim, ignoring this script's own drop-in. Fails unless exactly one.
+current_exec_start() {
+    systemctl cat "$service" | awk -v skip="$dropin_file" '
+        /^# \// { file = substr($0, 3); next }
+        file == skip { next }
+        {
+            if (cont) {
+                value = value "\n" $0
+            } else if ($0 ~ /^[[:space:]]*ExecStart[[:space:]]*=/) {
+                sub(/^[[:space:]]*ExecStart[[:space:]]*=[[:space:]]*/, "")
+                value = $0
+            } else {
+                next
+            }
+            cont = ($0 ~ /\\$/)
+            if (!cont) {
+                if (value == "") { n = 0 } else { n++; last = value }
+            }
+        }
+        END { if (n != 1) exit 1; print last }'
+}
+
+exec_argv() {
+    systemctl show --property=ExecStart --value "$service" |
+        sed -n 's/.*argv\[\]=\(.*\) ; ignore_errors=.*/\1/p'
+}
+
+# Makes the CockroachDB unit run $AGENT_LINK with its existing arguments.
+# Takes effect at the unit's next restart, which the agent performs. On a
+# rerun the previous drop-in stays in place until the new one is verified.
+write_exec_dropin() {
+    local exec rest before after previous="" tmp
+    exec=$(current_exec_start) || die "$service must have exactly one ExecStart"
+    rest=${exec#"$SYSTEM_BINARY"}
+    [[ $rest != "$exec" && ( -z $rest || $rest == [[:space:]]* ) ]] ||
+        die "$service ExecStart does not run $SYSTEM_BINARY: $exec"
+    as_agent "$AGENT_LINK" version --build-tag >/dev/null ||
+        die "$AGENT_LINK does not run"
+
+    before=$(exec_argv)
+    [[ -f $dropin_file ]] && previous=$(cat "$dropin_file")
+    install -d -o root -g root -m 0755 "$dropin_dir"
+    tmp=$(mktemp "${dropin_file}.XXXXXX")
+    printf '# Written by install-rollout-agent.sh. Removed by --uninstall.\n[Service]\nExecStart=\nExecStart=%s%s\n' \
+        "$AGENT_LINK" "$rest" >"$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$dropin_file"
+    systemctl daemon-reload
+
+    # Only the executable may change: compare everything after argv[0].
+    after=$(exec_argv)
+    if [[ $after != "$AGENT_LINK"* || ${after#* } != "${before#* }" ]]; then
+        if [[ -n $previous ]]; then
+            printf '%s\n' "$previous" >"$dropin_file"
+        else
+            rm -f "$dropin_file"
+        fi
+        systemctl daemon-reload
+        die "drop-in would change $service arguments; reverted it. before: $before after: $after"
+    fi
+    log "$service runs $AGENT_LINK from its next restart"
+}
+
+# Refuses to drop the override while the agent link runs a different version
+# than $SYSTEM_BINARY: the next restart would silently change versions.
+remove_exec_dropin() {
+    if [[ ! -f $dropin_file ]]; then
+        log "no ExecStart drop-in for $service"
         return
     fi
-    local resolved
-    resolved=$(readlink -f "$SYSTEM_BINARY")
-    [[ -f $resolved ]] || die "$SYSTEM_BINARY resolves to missing $resolved"
-    install -o root -g root -m 0755 "$resolved" "${SYSTEM_BINARY}.rollout-restore"
-    mv -Tf "${SYSTEM_BINARY}.rollout-restore" "$SYSTEM_BINARY"
-    log "$SYSTEM_BINARY restored as a regular file from $resolved"
+    require_root_owned_system_binary
+    local system_tag agent_tag
+    system_tag=$(as_agent "$SYSTEM_BINARY" version --build-tag)
+    agent_tag=$(as_agent "$AGENT_LINK" version --build-tag) || die "$AGENT_LINK does not run"
+    [[ $system_tag == "$agent_tag" ]] ||
+        die "$service runs $agent_tag but $SYSTEM_BINARY is $system_tag; install the official $agent_tag binary at $SYSTEM_BINARY first"
+    rm -f "$dropin_file"
+    rmdir --ignore-fail-on-non-empty "$dropin_dir"
+    log "removed $dropin_file; $service runs $SYSTEM_BINARY from its next restart"
 }
 
 [[ -n $service ]] || service=$(detect_service)
 log "cockroach unit: $service"
+dropin_dir="/etc/systemd/system/${service}.d"
+dropin_file="${dropin_dir}/${DROPIN_NAME}"
 
 if $uninstall; then
     systemctl disable --now cockroach-rollout-agent.service 2>/dev/null || true
-    revert_binary_layout
+    remove_exec_dropin
     rm -f "$POLKIT_FILE" "$UNIT_FILE"
     systemctl daemon-reload
     log "uninstalled; $AGENT_ROOT, $LOG_DIR, $CERTS_DIR and $ENV_FILE were kept"
@@ -154,14 +237,15 @@ for file in ca.crt client.rollout.crt client.rollout.key; do
     [[ -f $certs_src/$file ]] || die "missing $certs_src/$file"
 done
 command -v pkcheck >/dev/null || die "polkit (pkcheck) is not installed"
+command -v runuser >/dev/null || die "runuser (util-linux) is not installed"
 
 log "installing agent binary"
 install -o root -g root -m 0755 "$agent_binary_src" "${AGENT_BINARY}.next"
 mv -f "${AGENT_BINARY}.next" "$AGENT_BINARY"
 
 log "creating directories"
-install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0750 \
-    "$AGENT_ROOT" "$AGENT_ROOT/bin" "$AGENT_ROOT/versions" "$AGENT_ROOT/artifacts" "$LOG_DIR"
+install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0750 "$AGENT_ROOT" "$LOG_DIR"
+as_agent mkdir -p -m 0750 "$AGENT_ROOT/bin" "$AGENT_ROOT/versions" "$AGENT_ROOT/artifacts"
 install -d -o root -g root -m 0755 /etc/cockroach-rollout-agent
 install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$CERTS_DIR"
 
@@ -176,7 +260,7 @@ chown "$AGENT_USER:$AGENT_USER" "$key_tmp"
 chmod 0600 "$key_tmp"
 mv -f "$key_tmp" "$CERTS_DIR/client.rollout.pk8"
 
-convert_binary_layout
+stage_current_binary
 
 log "writing env, unit, and polkit rule"
 render "$EXAMPLES_DIR/cockroach-rollout-agent.env.example" "$ENV_FILE" 0640 "root:$AGENT_USER"
@@ -184,6 +268,7 @@ render "$EXAMPLES_DIR/cockroach-rollout-agent.service" "$UNIT_FILE" 0644 root:ro
 install -d -o root -g root -m 0755 "$(dirname "$POLKIT_FILE")"
 render "$EXAMPLES_DIR/50-cockroach-rollout-agent.rules" "$POLKIT_FILE" 0644 root:root
 systemctl daemon-reload
+write_exec_dropin
 
 # Run inside the same sandbox as the real unit, so the writability and
 # restart-authorization probes see exactly what the daemon will see.
