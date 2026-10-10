@@ -1,7 +1,7 @@
 // file: src/health.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 416df5cc-ca4d-4537-9e70-832f54a196f1
-// last-edited: 2026-09-29
+// last-edited: 2026-10-10
 
 //! The gate an agent must pass before it may restart its node.
 
@@ -28,9 +28,29 @@ pub struct ClusterHealth {
 /// ever restarting. The question is whether the cluster has fully recovered
 /// from the *previous* restart.
 pub fn safe_to_restart(health: &ClusterHealth) -> Result<(), String> {
-    // TODO(jdfalk): decide what "recovered" means for this cluster.
-    let _ = health;
-    Err("health gate not implemented".to_string())
+    if health.active_nodes == 0 {
+        return Err("no active cluster members observed; refusing to restart".to_string());
+    }
+    if health.live_nodes < health.active_nodes {
+        return Err(format!(
+            "{} of {} active nodes are not live; waiting for them to rejoin",
+            health.active_nodes - health.live_nodes,
+            health.active_nodes
+        ));
+    }
+    if health.unavailable_ranges > 0 {
+        return Err(format!(
+            "{} ranges are unavailable; waiting for quorum to recover",
+            health.unavailable_ranges
+        ));
+    }
+    if health.underreplicated_ranges > 0 {
+        return Err(format!(
+            "{} ranges are under-replicated; waiting for up-replication",
+            health.underreplicated_ranges
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
