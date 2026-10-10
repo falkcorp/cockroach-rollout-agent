@@ -1,5 +1,5 @@
 <!-- file: docs/deploy.md -->
-<!-- version: 2.1.0 -->
+<!-- version: 2.2.0 -->
 <!-- guid: 41eb3d6e-f70e-431d-8f3e-33d1ca5e45c1 -->
 <!-- last-edited: 2026-10-10 -->
 
@@ -108,7 +108,8 @@ versions; install the matching official binary there first.
 
 - that the CockroachDB unit's `ExecStart` runs the agent link, which resolves;
 - that the agent's directories are writable through the sandbox;
-- polkit restart authorization, probed with `pkcheck`;
+- polkit authorization for the CockroachDB unit, probed with
+  `systemctl reset-failed`, which changes nothing on a healthy unit;
 - SQL access.
 
 Treat a failed self-check as a blocker.
