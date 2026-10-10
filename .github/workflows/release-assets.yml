@@ -1,5 +1,5 @@
 # file: .github/workflows/release-assets.yml
-# version: 1.4.0
+# version: 2.0.0
 # guid: 6ac4e69b-1c8d-4465-bb8d-d4b950850d0a
 
 name: Release Linux Assets
@@ -26,9 +26,19 @@ permissions:
   id-token: write
 
 jobs:
-  linux-assets:
-    name: Build Linux Assets
-    runs-on: ubuntu-latest
+  # Each architecture builds natively: cross-compiling openssl-sys for arm64
+  # needs an arm64 OpenSSL sysroot the amd64 runner does not have.
+  build:
+    name: Build linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -40,31 +50,38 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: stable
-          target: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
           cache: true
 
-      - name: Install arm64 linker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build
+        run: cargo build --release --locked
 
-      - name: Build amd64
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
-
-      - name: Build arm64
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
-
-      - name: Package assets
+      - name: Package
         run: |
           mkdir -p dist/pkg
-          cp target/x86_64-unknown-linux-gnu/release/cockroach-rollout-agent dist/pkg/cockroach-rollout-agent
-          tar -C dist/pkg -czf dist/cockroach-rollout-agent-linux-amd64.tar.gz cockroach-rollout-agent
-          cp target/aarch64-unknown-linux-gnu/release/cockroach-rollout-agent dist/pkg/cockroach-rollout-agent
-          tar -C dist/pkg -czf dist/cockroach-rollout-agent-linux-arm64.tar.gz cockroach-rollout-agent
-          cd dist
-          sha256sum cockroach-rollout-agent-linux-amd64.tar.gz cockroach-rollout-agent-linux-arm64.tar.gz > SHA256SUMS
+          cp target/release/cockroach-rollout-agent dist/pkg/cockroach-rollout-agent
+          tar -C dist/pkg -czf "dist/cockroach-rollout-agent-linux-${{ matrix.arch }}.tar.gz" cockroach-rollout-agent
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/cockroach-rollout-agent-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Attach assets to release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum cockroach-rollout-agent-linux-amd64.tar.gz cockroach-rollout-agent-linux-arm64.tar.gz > SHA256SUMS
 
       - name: Upload release assets
         env:
@@ -72,6 +89,7 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           gh release upload "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
             dist/cockroach-rollout-agent-linux-amd64.tar.gz \
             dist/cockroach-rollout-agent-linux-arm64.tar.gz \
             dist/SHA256SUMS \
