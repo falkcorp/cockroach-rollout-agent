@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 3.1.0
+// version: 3.2.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-10
 
@@ -29,7 +29,7 @@ use crate::health::{ClusterHealth, safe_to_restart};
 use crate::layout::{BinaryLayout, probe_writable};
 use crate::rollout::{
     FollowerAction, LeaderAction, NodeObservation, RolloutStatus, all_nodes_on, follower_action,
-    leader_action, stale_after,
+    leader_action, live_version_span, stale_after,
 };
 
 const DEFAULT_BASE_URL: &str = "https://binaries.cockroachdb.com";
@@ -782,23 +782,34 @@ fn propose_next_rollout(
     client: &mut Client,
     nodes: &[NodeObservation],
 ) -> Result<(), AppError> {
-    let Some(current) = uniform_cluster_version(nodes) else {
+    let (oldest, newest) = match live_version_span(nodes) {
+        Ok(span) => span,
+        Err(reason) => return audit(cli, "proposal_skipped", &reason),
+    };
+    let Some(plan) = next_upgrade_plan(cli, Some(&oldest.to_string()), None)? else {
+        if newest != oldest {
+            return audit(
+                cli,
+                "proposal_skipped",
+                &format!("nodes run {oldest} and {newest}, but {oldest} needs no upgrade step"),
+            );
+        }
+        return Ok(());
+    };
+    // A partially applied upgrade is resumed only when the nodes already
+    // ahead run exactly this step's target; they then count as done.
+    if newest != oldest && plan.next_version != newest {
         return audit(
             cli,
             "proposal_skipped",
-            "cluster nodes are not all live on one version",
+            &format!(
+                "nodes run {oldest} and {newest}, but the next step from {oldest} is {}; finish or revert the partial upgrade by hand",
+                plan.next_version
+            ),
         );
-    };
-    let Some(plan) = next_upgrade_plan(cli, Some(&current.to_string()), None)? else {
-        return Ok(());
-    };
+    }
     let manifest = create_manifest_for_plan(cli, plan)?;
     publish_rollout(cli, client, &manifest)
-}
-
-fn uniform_cluster_version(nodes: &[NodeObservation]) -> Option<Version> {
-    let first = nodes.first()?.version.clone()?;
-    all_nodes_on(&first, nodes).then_some(first)
 }
 
 fn follower_reconcile(
