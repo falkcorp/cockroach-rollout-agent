@@ -1,10 +1,12 @@
 // file: examples/50-cockroach-rollout-agent.rules
-// version: 1.0.0
+// version: 1.1.0
 // guid: a6a245df-429e-4e36-ba74-4b6f0895d789
-// last-edited: 2026-09-29
+// last-edited: 2026-10-10
 
-// Lets the `cockroach` user start, stop, and restart exactly one unit: the
-// CockroachDB service on this host. Nothing else is granted.
+// Lets the `cockroach` user start, stop, restart, and reset-failed exactly
+// one unit: the CockroachDB service on this host. Nothing else is granted.
+// reset-failed is harmless on a healthy unit; `self-check` uses it to prove
+// this rule matches, because only root may pass details to `pkcheck`.
 //
 // Install as /etc/polkit-1/rules.d/50-cockroach-rollout-agent.rules (0644
 // root:root) after replacing @CROACH_ROLLOUT_SERVICE@ with this host's unit
@@ -26,7 +28,8 @@ polkit.addRule(function (action, subject) {
         return polkit.Result.NOT_HANDLED;
     }
     var verb = action.lookup("verb");
-    if (verb === "start" || verb === "stop" || verb === "restart") {
+    if (verb === "start" || verb === "stop" || verb === "restart" ||
+        verb === "reset-failed") {
         return polkit.Result.YES;
     }
     return polkit.Result.NOT_HANDLED;

@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 3.2.0
+// version: 3.3.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-10
 
@@ -49,7 +49,6 @@ const INSTALL_LEASE: &str = "install";
 /// crashed holder blocks the next node for a bounded time instead of forever.
 const INSTALL_LEASE_EXTRA_SECONDS: u64 = 900;
 const HEALTH_POLL_SECONDS: u64 = 5;
-const POLKIT_MANAGE_UNITS: &str = "org.freedesktop.systemd1.manage-units";
 const DEFAULT_SCHEMA: &str = "cockroach_rollout";
 const SUPPORTED_ARCHES: &[&str] = &["amd64", "arm64"];
 const BREAKING_CHANGE_PATTERNS: &[&str] = &[
@@ -1921,7 +1920,7 @@ fn self_check_command(cli: &Cli) -> Result<(), AppError> {
         }
     };
 
-    for command in ["tar", "systemctl", "pkcheck"] {
+    for command in ["tar", "systemctl"] {
         check(
             &format!("command {command}"),
             require_command(command)
@@ -2000,31 +1999,24 @@ fn self_check_command(cli: &Cli) -> Result<(), AppError> {
     }
 }
 
-/// Asks polkit whether this process may restart `service`, without
-/// restarting it. systemd's rules key off the `unit` and `verb` details, so
-/// the probe passes both.
+/// Proves polkit lets this process manage `service`, without restarting it.
+///
+/// `pkcheck --detail` is reserved for root, so an unprivileged probe cannot
+/// pass the `unit` and `verb` details the rule matches on. Instead this asks
+/// systemd itself to `reset-failed` the unit: systemd consults polkit with
+/// the real details (verb `reset-failed`, which the rule allows alongside
+/// start/stop/restart), and on a unit that has not failed it changes nothing.
 fn polkit_can_restart(service: &str) -> Result<String, String> {
-    let output = Command::new("pkcheck")
-        .args([
-            "--action-id",
-            POLKIT_MANAGE_UNITS,
-            "--process",
-            &std::process::id().to_string(),
-            "--detail",
-            "unit",
-            service,
-            "--detail",
-            "verb",
-            "restart",
-        ])
+    let output = Command::new("systemctl")
+        .args(["--no-ask-password", "reset-failed", service])
         .stdin(Stdio::null())
         .output()
-        .map_err(|error| format!("could not run pkcheck: {error}"))?;
+        .map_err(|error| format!("could not run systemctl: {error}"))?;
     if output.status.success() {
-        Ok(format!("polkit allows restart of {service}"))
+        Ok(format!("polkit allows managing {service}"))
     } else {
         Err(format!(
-            "polkit denies restart of {service}; install the polkit rule for this unit ({})",
+            "polkit denies managing {service}; install the polkit rule for this unit ({})",
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
