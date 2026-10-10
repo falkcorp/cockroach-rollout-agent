@@ -13,7 +13,9 @@ The CockroachDB unit now runs `/var/lib/cockroach-rollout-agent/bin/cockroach`
 through an `ExecStart` systemd drop-in. `/usr/local/bin/cockroach` stays a
 root-owned file the agent never touches; it can lag the server after a rollout.
 The installer does every operation inside the agent root as `cockroach` and
-never follows links there as root. `--uninstall` removes the drop-in and refuses
+never follows links there as root, and refuses to add the drop-in unless the
+CockroachDB unit itself runs as `cockroach`. The client certificate directory
+is now `root:cockroach 0750` so root never writes into an agent-owned path. `--uninstall` removes the drop-in and refuses
 while the two binaries are different versions. The agent's `self-check` and
 upgrade path verify the unit's `ExecStart` with `systemctl show`.
 `CROACH_ROLLOUT_BINARY_PATH` now defaults to `<agent-root>/bin/cockroach`.
