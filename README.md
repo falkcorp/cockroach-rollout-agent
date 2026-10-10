@@ -1,7 +1,7 @@
 <!-- file: README.md -->
-<!-- version: 4.0.0 -->
+<!-- version: 4.1.0 -->
 <!-- guid: c68a62ce-72d1-45cc-a6c8-d3dfc41d0e34 -->
-<!-- last-edited: 2026-09-29 -->
+<!-- last-edited: 2026-10-10 -->
 
 # cockroach-rollout-agent
 
@@ -90,7 +90,7 @@ Code Quality is enabled for the repository or account during the public preview.
 | `CROACH_ROLLOUT_RELEASE_NOTES_BASE_URL` | `https://www.cockroachlabs.com/docs/releases` |
 | `CROACH_ROLLOUT_ARTIFACTS_DIR` | `dist` |
 | `CROACH_ROLLOUT_SERVICE` | unset, required for installs (the unit name differs between hosts) |
-| `CROACH_ROLLOUT_BINARY_PATH` | `/usr/local/bin/cockroach` |
+| `CROACH_ROLLOUT_BINARY_PATH` | `<agent-root>/bin/cockroach` |
 | `CROACH_ROLLOUT_AGENT_ROOT` | `/var/lib/cockroach-rollout-agent` |
 | `CROACH_ROLLOUT_RESTART_TIMEOUT_SECONDS` | `600` |
 | `CROACH_ROLLOUT_AUTO_FINALIZE` | unset (operator runs `finalize`) |
@@ -238,9 +238,10 @@ is authenticated and authorization is still anchored in the cluster lease.
 The daemon runs as the `cockroach` user with `NoNewPrivileges=true` and
 `ProtectSystem=strict`. It needs no root and no sudo:
 
-- `/usr/local/bin/cockroach` is a root-owned symlink into
-  `/var/lib/cockroach-rollout-agent`, where the agent swaps a second symlink
-  between staged versions;
+- the CockroachDB unit runs `/var/lib/cockroach-rollout-agent/bin/cockroach`
+  through an `ExecStart` drop-in, and the agent swaps that symlink between
+  staged versions. `/usr/local/bin/cockroach` stays a separate root-owned copy,
+  so root never executes a binary the `cockroach` user can write;
 - a polkit rule (`examples/50-cockroach-rollout-agent.rules`) allows only
   start, stop, and restart of the one CockroachDB unit, for `cockroach` only;
 - the audit log and state directories are the only writable paths.

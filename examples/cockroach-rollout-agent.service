@@ -1,5 +1,5 @@
 # file: examples/cockroach-rollout-agent.service
-# version: 3.0.0
+# version: 3.1.0
 # guid: eaf842e1-7611-4539-848e-73b84ed31c7e
 
 # Replace @CROACH_ROLLOUT_SERVICE@ with this host's CockroachDB unit name.
@@ -23,8 +23,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-# Every agent write lands here. /usr/local/bin/cockroach is a root-owned
-# symlink into /var/lib/cockroach-rollout-agent/bin, so it stays read-only.
+# Every agent write lands here. The CockroachDB unit runs
+# /var/lib/cockroach-rollout-agent/bin/cockroach through an ExecStart drop-in;
+# /usr/local/bin/cockroach is a separate root-owned copy the agent never touches.
 ReadWritePaths=/var/log/cockroach-rollout-agent /var/lib/cockroach-rollout-agent
 
 [Install]
