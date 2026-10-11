@@ -1,5 +1,5 @@
 // file: src/web/routes.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: f0fcb0b6-3ed3-41ea-a74c-a624cd821a36
 // last-edited: 2026-10-11
 
@@ -18,6 +18,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 use tower_http::catch_panic::CatchPanicLayer;
 
 use super::auth::{self, LoginLimiter, Session};
@@ -27,12 +28,27 @@ use crate::ops::{Actor, available_actions};
 const FLASH_COOKIE: &str = "crra_flash";
 /// Hex doubles the size; this keeps the cookie under the 4 KiB browser limit.
 const FLASH_MAX_BYTES: usize = 1500;
+/// argon2id holds 19 MiB per check; this caps the memory any burst of logins
+/// can take from a host that also runs CockroachDB.
+const PASSWORD_CHECK_SLOTS: usize = 4;
 
 #[derive(Clone)]
 pub struct AppState {
     pub backend: Arc<dyn Backend>,
     pub limiter: Arc<LoginLimiter>,
     pub session_ttl: Duration,
+    password_checks: Arc<Semaphore>,
+}
+
+impl AppState {
+    pub fn new(backend: Arc<dyn Backend>, session_ttl: Duration) -> Self {
+        Self {
+            backend,
+            limiter: Arc::new(LoginLimiter::new()),
+            session_ttl,
+            password_checks: Arc::new(Semaphore::new(PASSWORD_CHECK_SLOTS)),
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -190,16 +206,23 @@ async fn login(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let ip = peer.ip();
-    if state.limiter.blocked(ip, Instant::now()) {
+    let Some(attempt) = state.limiter.try_begin(ip, Instant::now()) else {
         return page(
             StatusCode::TOO_MANY_REQUESTS,
             render::login_page(Some(
                 "too many failed attempts; wait a minute and try again",
             )),
         );
-    }
+    };
+    let Ok(slot) = state.password_checks.clone().try_acquire_owned() else {
+        return page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            render::login_page(Some("the server is busy checking passwords; try again")),
+        );
+    };
     let backend = state.backend.clone();
     let checked = blocking(move || {
+        let _slot = slot;
         let Some(hash) = backend.password_hash()? else {
             return Ok(None);
         };
@@ -213,14 +236,14 @@ async fn login(
         ),
         Ok(None) => page(StatusCode::FORBIDDEN, render::password_unset_page()),
         Ok(Some(false)) => {
-            state.limiter.record_failure(ip, Instant::now());
+            attempt.failed(Instant::now());
             page(
                 StatusCode::UNAUTHORIZED,
                 render::login_page(Some("wrong password")),
             )
         }
         Ok(Some(true)) => {
-            state.limiter.record_success(ip);
+            attempt.succeeded();
             let token = auth::random_token();
             let csrf = auth::random_token();
             let key = auth::token_sha256(&token);
