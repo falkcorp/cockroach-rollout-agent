@@ -1,5 +1,5 @@
 // file: src/cluster_view.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: b65f6d37-171d-4be5-8fbc-306d362e20c2
 // last-edited: 2026-10-11
 
@@ -35,7 +35,6 @@ pub struct ClusterView {
 
 #[derive(Debug, Clone)]
 pub struct RolloutRow {
-    pub id: String,
     pub kind: RolloutKind,
     pub status: RolloutStatus,
     pub from: String,
@@ -50,7 +49,6 @@ pub struct RolloutRow {
 /// The open rollout, reduced to what operators and prechecks need.
 #[derive(Debug, Clone)]
 pub struct OpenSummary {
-    pub id: String,
     pub kind: RolloutKind,
     pub status: RolloutStatus,
     pub from: Version,
@@ -68,7 +66,6 @@ impl OpenSummary {
 impl From<&OpenRollout> for OpenSummary {
     fn from(rollout: &OpenRollout) -> Self {
         Self {
-            id: rollout.id.clone(),
             kind: rollout.kind,
             status: rollout.status,
             from: rollout.manifest.current_version.clone(),
@@ -117,7 +114,7 @@ pub fn load(cli: &Cli, client: &mut Client) -> Result<ClusterView, AppError> {
     for row in client.query(
         &format!(
             "
-            SELECT id::STRING, kind, status, current_version, target_version, created_by,
+            SELECT kind, status, current_version, target_version, created_by,
                    created_at::STRING, approved_by, approved_at::STRING, error
             FROM {schema}.rollouts
             ORDER BY created_at DESC
@@ -126,19 +123,18 @@ pub fn load(cli: &Cli, client: &mut Client) -> Result<ClusterView, AppError> {
         ),
         &[&ROLLOUTS_SHOWN],
     )? {
-        let kind: String = row.get(1);
-        let status: String = row.get(2);
+        let kind: String = row.get(0);
+        let status: String = row.get(1);
         rollouts.push(RolloutRow {
-            id: row.get(0),
             kind: kind.parse().map_err(AppError::Message)?,
             status: status.parse().map_err(AppError::Message)?,
-            from: row.get(3),
-            to: row.get(4),
-            created_by: row.get(5),
-            created_at: row.get(6),
-            approved_by: row.get(7),
-            approved_at: row.get(8),
-            error: row.get(9),
+            from: row.get(2),
+            to: row.get(3),
+            created_by: row.get(4),
+            created_at: row.get(5),
+            approved_by: row.get(6),
+            approved_at: row.get(7),
+            error: row.get(8),
         });
     }
 
@@ -296,7 +292,6 @@ impl ClusterView {
 impl OpenSummary {
     pub fn sample(kind: RolloutKind, status: RolloutStatus, from: &str, to: &str) -> Self {
         Self {
-            id: "r1".to_string(),
             kind,
             status,
             from: Version::parse(from).expect("literal should parse"),
@@ -347,7 +342,6 @@ mod tests {
             },
         };
         let summary = OpenSummary::from(&rollout);
-        assert_eq!(summary.id, "r9");
         assert_eq!(summary.kind, RolloutKind::Restart);
         assert_eq!(summary.to, Version::new(25, 4, 17));
         assert_eq!(summary.warnings, vec!["removed".to_string()]);
