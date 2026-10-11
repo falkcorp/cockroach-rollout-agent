@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 3.10.0
+// version: 3.11.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-11
 
@@ -13,9 +13,11 @@ mod web;
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -50,6 +52,7 @@ const DEFAULT_DAEMON_INTERVAL_SECONDS: u64 = 300;
 const DEFAULT_LEASE_SECONDS: u64 = 90;
 const DEFAULT_AGENT_ROOT: &str = "/var/lib/cockroach-rollout-agent";
 const DEFAULT_RESTART_TIMEOUT_SECONDS: u64 = 600;
+const DEFAULT_UI_LISTEN: &str = "0.0.0.0:38090";
 const LEADER_LEASE: &str = "leader";
 const INSTALL_LEASE: &str = "install";
 /// The install lease outlives a full download + restart + health wait, so a
@@ -155,6 +158,19 @@ struct Cli {
     #[arg(long, env = "CROACH_ROLLOUT_NODE_ID")]
     node_id: Option<String>,
 
+    /// Address the web UI listens on, or `off`.
+    #[arg(long, env = "CROACH_ROLLOUT_UI_LISTEN", default_value = DEFAULT_UI_LISTEN)]
+    ui_listen: String,
+
+    /// Directory holding `node.crt` and `node.key` for the UI. Defaults to
+    /// the CockroachDB unit's `--certs-dir`.
+    #[arg(long, env = "CROACH_ROLLOUT_UI_CERTS_DIR")]
+    ui_certs_dir: Option<PathBuf>,
+
+    /// How long a UI login lasts.
+    #[arg(long, env = "CROACH_ROLLOUT_UI_SESSION_HOURS", default_value_t = 12)]
+    ui_session_hours: u64,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -240,6 +256,10 @@ enum Commands {
     /// Restart every node, one at a time, on the version it already runs.
     /// Same install lease and health gate as an upgrade.
     RestartCluster,
+
+    /// Set the shared web UI password and sign out every session. Reads the
+    /// password from stdin, prompting without echo on a terminal.
+    SetUiPassword,
 
     /// Show rollouts, cluster nodes, agents, and lease holders.
     Status,
@@ -410,6 +430,7 @@ fn run() -> Result<(), AppError> {
         } => approve_command(&cli, version, *accept_release_note_warnings),
         Commands::Cancel { reason } => cancel_command(&cli, reason),
         Commands::RestartCluster => restart_cluster_command(&cli),
+        Commands::SetUiPassword => set_ui_password_command(&cli),
         Commands::Status => status_command(&cli),
         Commands::InitDb => init_db_command(&cli),
         Commands::Discover => discover_command(&cli),
@@ -680,6 +701,10 @@ fn db_daemon_command(
             cli.schema
         ),
     )?;
+    // Dry runs promise to write nothing, and UI actions write.
+    if !dry_run {
+        start_web_ui(cli)?;
+    }
 
     let mut schema_ready = false;
     loop {
@@ -2195,6 +2220,17 @@ fn self_check_command(cli: &Cli) -> Result<(), AppError> {
     if let Ok(service) = &service {
         check("restart authorization", polkit_can_restart(service));
     }
+    match ui_listen_addr(&cli.ui_listen) {
+        Ok(None) => check(
+            "ui tls",
+            Ok("UI disabled (CROACH_ROLLOUT_UI_LISTEN=off)".to_string()),
+        ),
+        Ok(Some(listen)) => check(
+            "ui tls",
+            ui_tls(cli).map(|(dir, _)| format!("{listen} with {}/node.crt", dir.display())),
+        ),
+        Err(reason) => check("ui tls", Err(reason)),
+    }
 
     if cli.database_url.is_some() {
         check(
@@ -2229,6 +2265,99 @@ fn self_check_command(cli: &Cli) -> Result<(), AppError> {
             failures.join(", ")
         )))
     }
+}
+
+fn ui_listen_addr(value: &str) -> Result<Option<SocketAddr>, String> {
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    value.parse().map(Some).map_err(|error| {
+        format!("CROACH_ROLLOUT_UI_LISTEN={value} is neither an address nor off: {error}")
+    })
+}
+
+/// The UI's certs dir and TLS config, the same resolution `self-check` reports.
+fn ui_tls(cli: &Cli) -> Result<(PathBuf, rustls::ServerConfig), String> {
+    let dir = match &cli.ui_certs_dir {
+        Some(dir) => dir.clone(),
+        None => web::tls::resolve_certs_dir(
+            None,
+            service_name(cli).map_err(|error| error.to_string())?,
+        )?,
+    };
+    let config = web::tls::load_server_config(&dir)?;
+    Ok((dir, config))
+}
+
+/// Starts the UI thread. Every failure leaves the UI off and the daemon
+/// running: rollouts never depend on the UI, and it never falls back to HTTP.
+fn start_web_ui(cli: &Cli) -> Result<(), AppError> {
+    let listen = match ui_listen_addr(&cli.ui_listen) {
+        Ok(Some(listen)) => listen,
+        Ok(None) => return audit(cli, "ui_disabled", "CROACH_ROLLOUT_UI_LISTEN=off"),
+        Err(reason) => {
+            eprintln!("ui disabled: {reason}");
+            return audit(cli, "ui_disabled", &reason);
+        }
+    };
+    let tls = match ui_tls(cli) {
+        Ok((_, config)) => config,
+        Err(reason) => {
+            eprintln!("ui disabled: {reason}");
+            return audit(cli, "ui_disabled", &reason);
+        }
+    };
+    let state = web::routes::AppState {
+        backend: Arc::new(web::db::DbBackend::new(cli.clone())),
+        limiter: Arc::new(web::auth::LoginLimiter::new()),
+        session_ttl: Duration::from_secs(cli.ui_session_hours.saturating_mul(3600)),
+    };
+    match web::spawn(listen, state, tls) {
+        Ok(_) => audit(cli, "ui_started", &format!("listen={listen}")),
+        Err(error) => {
+            let reason = format!("cannot listen on {listen}: {error}");
+            eprintln!("ui disabled: {reason}");
+            audit(cli, "ui_disabled", &reason)
+        }
+    }
+}
+
+fn set_ui_password_command(cli: &Cli) -> Result<(), AppError> {
+    let password = read_new_password()?;
+    let hash = web::auth::hash_password(&password).map_err(AppError::Message)?;
+    let mut client = db_client(cli)?;
+    ensure_schema(cli, &mut client)?;
+    let schema = sql_ident(&cli.schema)?;
+    client.execute(
+        &format!(
+            "UPSERT INTO {schema}.ui_auth (id, password_hash, updated_at) VALUES (1, $1, now())"
+        ),
+        &[&hash],
+    )?;
+    let cleared = client.execute(&format!("DELETE FROM {schema}.ui_sessions"), &[])?;
+    events::note(
+        cli,
+        &mut client,
+        Source::Cli,
+        "ui_password_set",
+        &format!("by={} sessions_cleared={cleared}", Actor::Cli.label(cli)),
+    )?;
+    println!("UI password set; {cleared} existing session(s) signed out");
+    Ok(())
+}
+
+fn read_new_password() -> Result<String, AppError> {
+    if io::stdin().is_terminal() {
+        let first = rpassword::prompt_password("New UI password: ")?;
+        let second = rpassword::prompt_password("Repeat it: ")?;
+        if first != second {
+            return Err(AppError::Message("the passwords do not match".to_string()));
+        }
+        return Ok(first);
+    }
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
 /// Proves polkit lets this process manage `service`, without restarting it.
@@ -2759,6 +2888,18 @@ fn unix_time() -> Result<u64, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_listen_accepts_an_address_or_off() {
+        assert_eq!(ui_listen_addr("off"), Ok(None));
+        assert_eq!(ui_listen_addr("OFF"), Ok(None));
+        assert_eq!(
+            ui_listen_addr("0.0.0.0:38090"),
+            Ok(Some("0.0.0.0:38090".parse().unwrap()))
+        );
+        let error = ui_listen_addr("38090").unwrap_err();
+        assert!(error.contains("CROACH_ROLLOUT_UI_LISTEN"), "{error}");
+    }
 
     #[test]
     fn exec_start_path_is_parsed_from_systemctl_show() {
