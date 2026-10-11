@@ -1,5 +1,5 @@
 // file: src/rollout.rs
-// version: 1.3.0
+// version: 1.3.1
 // guid: ceae8795-4955-43fe-9829-2f28332e8005
 // last-edited: 2026-10-11
 
@@ -330,7 +330,11 @@ mod tests {
         }
     }
 
-    fn agent(node_id: i64, agent_version: Option<&str>, restarted: Option<&str>) -> AgentObservation {
+    fn agent(
+        node_id: i64,
+        agent_version: Option<&str>,
+        restarted: Option<&str>,
+    ) -> AgentObservation {
         AgentObservation {
             agent_id: format!("host{node_id}:amd64"),
             node_id: Some(node_id),
@@ -343,14 +347,20 @@ mod tests {
     fn restart_action_skips_nodes_already_restarted() {
         assert_eq!(restart_action("r1", None), RestartAction::Restart);
         assert_eq!(restart_action("r1", Some("r0")), RestartAction::Restart);
-        assert_eq!(restart_action("r1", Some("r1")), RestartAction::AlreadyRestarted);
+        assert_eq!(
+            restart_action("r1", Some("r1")),
+            RestartAction::AlreadyRestarted
+        );
     }
 
     #[test]
     fn restart_completes_only_when_every_live_node_restarted() {
         let nodes = [node(1, true, "25.4.17"), node(2, true, "25.4.17")];
         let new = Some("0.1.0");
-        assert!(!restart_complete(&[], &[], "r1"), "no nodes is never complete");
+        assert!(
+            !restart_complete(&[], &[], "r1"),
+            "no nodes is never complete"
+        );
         assert!(!restart_complete(&[], &nodes, "r1"));
         assert!(
             !restart_complete(&[agent(1, new, Some("r1"))], &nodes, "r1"),
@@ -394,8 +404,13 @@ mod tests {
         assert_eq!(gaps.len(), 3, "{gaps:?}");
         assert!(gaps[0].contains("host2:amd64"), "{gaps:?}");
         assert!(gaps[1].contains("node 3"), "{gaps:?}");
-        assert!(gaps[2].contains("host4:amd64") && gaps[2].contains("0.0.3"), "{gaps:?}");
-        assert!(restart_agent_gaps(&[agent(1, Some("1.0.0"), None)], &nodes[..1], &minimum).is_empty());
+        assert!(
+            gaps[2].contains("host4:amd64") && gaps[2].contains("0.0.3"),
+            "{gaps:?}"
+        );
+        assert!(
+            restart_agent_gaps(&[agent(1, Some("1.0.0"), None)], &nodes[..1], &minimum).is_empty()
+        );
     }
 
     #[test]
@@ -407,8 +422,18 @@ mod tests {
             !restarted_on(&expected, 100, &live, 100),
             "an unchanged start time is gossip from before the restart"
         );
-        assert!(!restarted_on(&expected, 100, &node(1, false, "25.4.17"), 200));
-        assert!(!restarted_on(&expected, 100, &node(1, true, "25.4.16"), 200));
+        assert!(!restarted_on(
+            &expected,
+            100,
+            &node(1, false, "25.4.17"),
+            200
+        ));
+        assert!(!restarted_on(
+            &expected,
+            100,
+            &node(1, true, "25.4.16"),
+            200
+        ));
     }
 
     #[test]

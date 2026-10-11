@@ -1,8 +1,9 @@
 // file: src/main.rs
-// version: 3.5.0
+// version: 3.6.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-11
 
+mod cluster_view;
 mod events;
 mod health;
 mod layout;
@@ -31,7 +32,7 @@ use crate::health::{ClusterHealth, safe_to_restart};
 use crate::layout::{BinaryLayout, probe_writable};
 use crate::rollout::{
     FollowerAction, LeaderAction, NodeObservation, RolloutKind, RolloutStatus, all_nodes_on,
-    follower_action, leader_action, live_version_span, stale_after,
+    follower_action, leader_action, live_version_span,
 };
 
 const DEFAULT_BASE_URL: &str = "https://binaries.cockroachdb.com";
@@ -1284,88 +1285,74 @@ fn cancel_command(cli: &Cli, reason: &str) -> Result<(), AppError> {
 
 fn status_command(cli: &Cli) -> Result<(), AppError> {
     let mut client = db_client(cli)?;
-    let schema = sql_ident(&cli.schema)?;
-    let stale = stale_after(Duration::from_secs(DEFAULT_DAEMON_INTERVAL_SECONDS));
+    ensure_schema(cli, &mut client)?;
+    let view = cluster_view::load(cli, &mut client)?;
 
     println!("ROLLOUTS (newest first)");
-    for row in client.query(
-        &format!(
-            "
-            SELECT status, current_version, target_version, created_by,
-                   created_at::STRING, coalesce(approved_by, ''), coalesce(error, '')
-            FROM {schema}.rollouts
-            ORDER BY created_at DESC
-            LIMIT 5
-            "
-        ),
-        &[],
-    )? {
-        let (status, from, target): (String, String, String) = (row.get(0), row.get(1), row.get(2));
-        let (by, at, approver, error): (String, String, String, String) =
-            (row.get(3), row.get(4), row.get(5), row.get(6));
-        println!("  {status:<10} {from} -> {target}  proposed by {by} at {at}");
-        if !approver.is_empty() {
+    for rollout in view.rollouts.iter().take(5) {
+        println!(
+            "  {:<10} {:<7} {} -> {}  proposed by {} at {}",
+            rollout.status.as_str(),
+            rollout.kind.as_str(),
+            rollout.from,
+            rollout.to,
+            rollout.created_by,
+            rollout.created_at
+        );
+        if let Some(approver) = &rollout.approved_by {
             println!("             approved by {approver}");
         }
-        if !error.is_empty() {
+        if let Some(error) = &rollout.error {
             println!("             error: {error}");
         }
     }
 
     println!("\nNODES");
-    for node in cluster_nodes(&mut client)? {
+    for node in &view.nodes {
         println!(
             "  n{:<3} live={:<5} version={}",
             node.node_id,
             node.is_live,
             node.version
+                .as_ref()
                 .map(|version| version.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         );
     }
 
     println!("\nAGENTS");
-    for row in client.query(
-        &format!(
-            "
-            SELECT agent_id, state, version, coalesce(error, ''),
-                   extract(epoch FROM now() - coalesce(last_seen, updated_at))::INT8
-            FROM {schema}.agent_status
-            ORDER BY agent_id
-            "
-        ),
-        &[],
-    )? {
-        let (agent, state, version, error): (String, String, String, String) =
-            (row.get(0), row.get(1), row.get(2), row.get(3));
-        let age: i64 = row.get(4);
-        let freshness = if age as u64 > stale.as_secs() {
-            format!("STALE ({age}s)")
+    for agent in &view.agents {
+        let freshness = if agent.is_stale(view.stale_after_secs) {
+            format!("STALE ({}s)", agent.age_secs)
         } else {
-            format!("{age}s ago")
+            format!("{}s ago", agent.age_secs)
         };
-        println!("  {agent:<28} {state:<18} {version:<10} {freshness}");
-        if !error.is_empty() {
+        println!(
+            "  {:<28} {:<18} {:<10} {}",
+            agent.observation.agent_id, agent.state, agent.version, freshness
+        );
+        if let Some(error) = &agent.error {
             println!("  {:<28} {error}", "");
         }
     }
 
     println!("\nLEASES");
-    for name in [LEADER_LEASE, INSTALL_LEASE] {
+    for lease in &view.leases {
         println!(
-            "  {name:<8} {}",
-            lease_holder(cli, &mut client, name)?.unwrap_or_else(|| "free".to_string())
+            "  {:<8} {}",
+            lease.name,
+            lease.holder.as_deref().unwrap_or("free")
         );
     }
 
-    match cluster_health(&mut client) {
+    match &view.health {
         Ok(health) => println!(
             "\nHEALTH\n  {}/{} nodes live, {} under-replicated, {} unavailable ranges; gate: {}",
             health.live_nodes,
             health.active_nodes,
             health.underreplicated_ranges,
             health.unavailable_ranges,
-            safe_to_restart(&health)
+            safe_to_restart(health)
                 .err()
                 .unwrap_or_else(|| "ok".to_string())
         ),
