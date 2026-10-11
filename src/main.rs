@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 3.11.0
+// version: 3.12.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-11
 
@@ -2307,11 +2307,10 @@ fn start_web_ui(cli: &Cli) -> Result<(), AppError> {
             return audit(cli, "ui_disabled", &reason);
         }
     };
-    let state = web::routes::AppState {
-        backend: Arc::new(web::db::DbBackend::new(cli.clone())),
-        limiter: Arc::new(web::auth::LoginLimiter::new()),
-        session_ttl: Duration::from_secs(cli.ui_session_hours.saturating_mul(3600)),
-    };
+    let state = web::routes::AppState::new(
+        Arc::new(web::db::DbBackend::new(cli.clone())),
+        Duration::from_secs(cli.ui_session_hours.saturating_mul(3600)),
+    );
     match web::spawn(listen, state, tls) {
         Ok(_) => audit(cli, "ui_started", &format!("listen={listen}")),
         Err(error) => {

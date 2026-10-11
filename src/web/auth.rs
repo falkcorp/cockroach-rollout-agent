@@ -1,5 +1,5 @@
 // file: src/web/auth.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 3b5291c0-75af-4721-8be7-20704b656704
 // last-edited: 2026-10-11
 
@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
@@ -78,11 +78,19 @@ pub fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+#[derive(Default)]
+struct IpRecord {
+    failures: Vec<Instant>,
+    /// Password checks admitted and not yet settled.
+    in_flight: usize,
+}
+
 /// Per-IP failed-login counter, in memory on each node. A speed bump against
-/// guessing, not a distributed lockout.
+/// guessing, not a distributed lockout. Checks still running count against
+/// the limit, so concurrent requests cannot slip past it.
 #[derive(Default)]
 pub struct LoginLimiter {
-    failures: Mutex<HashMap<IpAddr, Vec<Instant>>>,
+    records: Mutex<HashMap<IpAddr, IpRecord>>,
 }
 
 impl LoginLimiter {
@@ -90,37 +98,63 @@ impl LoginLimiter {
         Self::default()
     }
 
-    pub fn blocked(&self, ip: IpAddr, now: Instant) -> bool {
-        let failures = self
-            .failures
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        failures.get(&ip).is_some_and(|times| {
-            times
-                .iter()
-                .filter(|time| now.duration_since(**time) < FAILURE_WINDOW)
-                .count()
-                >= MAX_FAILURES
-        })
-    }
-
-    pub fn record_failure(&self, ip: IpAddr, now: Instant) {
-        let mut failures = self
-            .failures
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        failures.retain(|_, times| {
-            times.retain(|time| now.duration_since(*time) < FAILURE_WINDOW);
-            !times.is_empty()
-        });
-        failures.entry(ip).or_default().push(now);
-    }
-
-    pub fn record_success(&self, ip: IpAddr) {
-        self.failures
+    fn records(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, IpRecord>> {
+        self.records
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&ip);
+    }
+
+    /// Admits one password check for `ip`, or `None` when recent failures
+    /// plus checks in flight already reach `MAX_FAILURES`.
+    pub fn try_begin(self: &Arc<Self>, ip: IpAddr, now: Instant) -> Option<LoginAttempt> {
+        let mut records = self.records();
+        records.retain(|_, record| {
+            record
+                .failures
+                .retain(|time| now.duration_since(*time) < FAILURE_WINDOW);
+            !record.failures.is_empty() || record.in_flight > 0
+        });
+        let record = records.entry(ip).or_default();
+        if record.failures.len() + record.in_flight >= MAX_FAILURES {
+            return None;
+        }
+        record.in_flight += 1;
+        Some(LoginAttempt {
+            limiter: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+/// One admitted password check. Dropping it without a verdict (an error or
+/// a cancelled request) frees its slot without counting a failure.
+pub struct LoginAttempt {
+    limiter: Arc<LoginLimiter>,
+    ip: IpAddr,
+}
+
+impl LoginAttempt {
+    pub fn failed(self, now: Instant) {
+        self.limiter
+            .records()
+            .entry(self.ip)
+            .or_default()
+            .failures
+            .push(now);
+    }
+
+    pub fn succeeded(self) {
+        if let Some(record) = self.limiter.records().get_mut(&self.ip) {
+            record.failures.clear();
+        }
+    }
+}
+
+impl Drop for LoginAttempt {
+    fn drop(&mut self) {
+        if let Some(record) = self.limiter.records().get_mut(&self.ip) {
+            record.in_flight = record.in_flight.saturating_sub(1);
+        }
     }
 }
 
@@ -184,22 +218,57 @@ mod tests {
 
     #[test]
     fn five_failures_lock_an_ip_for_a_minute() {
-        let limiter = LoginLimiter::new();
+        let limiter = Arc::new(LoginLimiter::new());
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let other = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
         let start = Instant::now();
-        for _ in 0..4 {
-            limiter.record_failure(ip, start);
+        for _ in 0..5 {
+            limiter.try_begin(ip, start).unwrap().failed(start);
         }
-        assert!(!limiter.blocked(ip, start));
-        limiter.record_failure(ip, start);
-        assert!(limiter.blocked(ip, start));
-        assert!(!limiter.blocked(other, start), "lockout is per IP");
+        assert!(limiter.try_begin(ip, start).is_none());
         assert!(
-            !limiter.blocked(ip, start + Duration::from_secs(61)),
+            limiter.try_begin(other, start).is_some(),
+            "lockout is per IP"
+        );
+        assert!(
+            limiter
+                .try_begin(ip, start + Duration::from_secs(61))
+                .is_some(),
             "the window slides"
         );
-        limiter.record_success(ip);
-        assert!(!limiter.blocked(ip, start));
+    }
+
+    #[test]
+    fn checks_in_flight_count_against_the_limit() {
+        let limiter = Arc::new(LoginLimiter::new());
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let now = Instant::now();
+        let running: Vec<_> = (0..5)
+            .map(|_| limiter.try_begin(ip, now).unwrap())
+            .collect();
+        assert!(
+            limiter.try_begin(ip, now).is_none(),
+            "five unsettled checks fill the limit"
+        );
+        drop(running);
+        assert!(
+            limiter.try_begin(ip, now).is_some(),
+            "abandoned checks free their slots without counting as failures"
+        );
+    }
+
+    #[test]
+    fn success_clears_earlier_failures() {
+        let limiter = Arc::new(LoginLimiter::new());
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let now = Instant::now();
+        for _ in 0..4 {
+            limiter.try_begin(ip, now).unwrap().failed(now);
+        }
+        limiter.try_begin(ip, now).unwrap().succeeded();
+        for _ in 0..5 {
+            limiter.try_begin(ip, now).unwrap().failed(now);
+        }
+        assert!(limiter.try_begin(ip, now).is_none());
     }
 }

@@ -1,5 +1,5 @@
 // file: src/web/mod.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: 5a0df256-3b3d-47c1-8da7-af41189b6592
 // last-edited: 2026-10-11
 
@@ -119,6 +119,8 @@ pub fn spawn(
         .spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
+                // Bounds DB connections and argon2 memory under a request flood.
+                .max_blocking_threads(16)
                 .thread_name("web-ui-worker")
                 .enable_all()
                 .build()
@@ -212,11 +214,7 @@ mod tests {
         .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let state = routes::AppState {
-            backend: fake,
-            limiter: Arc::new(auth::LoginLimiter::new()),
-            session_ttl: Duration::from_secs(3600),
-        };
+        let state = routes::AppState::new(fake, Duration::from_secs(3600));
         tokio::spawn(serve(listener, state, tls));
         let client = reqwest::Client::builder()
             .add_root_certificate(reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap())
@@ -297,6 +295,40 @@ mod tests {
             response.status(),
             429,
             "locked out even with the right password"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_wrong_passwords_cannot_exceed_the_lockout() {
+        let (base, client) = start(FakeBackend::new(None)).await;
+        let attempts = (0..20).map(|_| {
+            let client = client.clone();
+            let url = format!("{base}/login");
+            tokio::spawn(async move {
+                client
+                    .post(url)
+                    .form(&[("password", "wrong password here")])
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            })
+        });
+        let mut statuses = Vec::new();
+        for attempt in attempts.collect::<Vec<_>>() {
+            statuses.push(attempt.await.unwrap());
+        }
+        let checked = statuses.iter().filter(|status| **status == 401).count();
+        assert!(
+            checked <= 5,
+            "{checked} passwords were checked: {statuses:?}"
+        );
+        assert!(
+            statuses
+                .iter()
+                .all(|status| [401, 429, 503].contains(status)),
+            "{statuses:?}"
         );
     }
 
