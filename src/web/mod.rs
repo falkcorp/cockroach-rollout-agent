@@ -1,5 +1,5 @@
 // file: src/web/mod.rs
-// version: 1.4.0
+// version: 1.5.0
 // guid: 5a0df256-3b3d-47c1-8da7-af41189b6592
 // last-edited: 2026-10-11
 
@@ -147,6 +147,7 @@ mod tests {
     struct FakeBackend {
         hash: String,
         view_error: Option<String>,
+        session_error: Option<String>,
         sessions: Mutex<HashMap<String, auth::Session>>,
         acted: Mutex<Vec<WebAction>>,
     }
@@ -156,6 +157,7 @@ mod tests {
             Arc::new(Self {
                 hash: auth::hash_password(PASSWORD).unwrap(),
                 view_error: view_error.map(str::to_string),
+                session_error: None,
                 sessions: Mutex::default(),
                 acted: Mutex::default(),
             })
@@ -183,6 +185,9 @@ mod tests {
             Ok(())
         }
         fn session(&self, key: &str) -> Result<Option<auth::Session>, String> {
+            if let Some(error) = &self.session_error {
+                return Err(error.clone());
+            }
             Ok(self.sessions.lock().unwrap().get(key).cloned())
         }
         fn delete_session(&self, key: &str) -> Result<(), String> {
@@ -460,6 +465,29 @@ mod tests {
             .await
             .unwrap();
         assert!(html.contains("database unreachable: connection refused"));
+        assert!(!html.contains("/actions/"));
+    }
+
+    /// The real backend reads the session from the DB first, so an outage
+    /// fails there: the page script swaps in any page with `#main`, even a
+    /// 503, so the banner replaces the stale dashboard.
+    #[tokio::test]
+    async fn an_outage_during_session_lookup_serves_the_banner_as_main() {
+        let fake = Arc::new(FakeBackend {
+            session_error: Some("connection refused".to_string()),
+            ..Arc::try_unwrap(FakeBackend::new(None)).ok().unwrap()
+        });
+        let (base, client) = start(fake).await;
+        let response = client
+            .get(format!("{base}/"))
+            .header("cookie", "crra_session=abc")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+        let html = response.text().await.unwrap();
+        assert!(html.contains("<main id=\"main\">"), "{html}");
+        assert!(html.contains("database unreachable"), "{html}");
         assert!(!html.contains("/actions/"));
     }
 
