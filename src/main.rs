@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 3.8.0
+// version: 3.9.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-11
 
@@ -9,6 +9,7 @@ mod health;
 mod layout;
 mod ops;
 mod rollout;
+mod web;
 
 use std::ffi::OsStr;
 use std::fs;
