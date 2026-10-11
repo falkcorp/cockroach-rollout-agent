@@ -1,5 +1,5 @@
 // file: src/web/mod.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 5a0df256-3b3d-47c1-8da7-af41189b6592
 // last-edited: 2026-10-11
 
@@ -7,3 +7,4 @@
 
 pub mod auth;
 pub mod render;
+pub mod tls;
