@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 3.9.0
+// version: 3.10.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-11
 
@@ -74,7 +74,7 @@ const BREAKING_CHANGE_PATTERNS: &[&str] = &[
     "migration",
 ];
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(author, version, about)]
 struct Cli {
     #[arg(long, env = "CROACH_ROLLOUT_BASE_URL", default_value = DEFAULT_BASE_URL)]
@@ -159,7 +159,7 @@ struct Cli {
     command: Commands,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum Commands {
     /// Download artifacts, scan notes, and write a rollout manifest.
     Prepare {
