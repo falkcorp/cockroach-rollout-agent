@@ -1,7 +1,7 @@
 <!-- file: docs/deploy.md -->
-<!-- version: 2.2.0 -->
+<!-- version: 2.3.0 -->
 <!-- guid: 41eb3d6e-f70e-431d-8f3e-33d1ca5e45c1 -->
-<!-- last-edited: 2026-10-10 -->
+<!-- last-edited: 2026-10-11 -->
 
 # Deployment
 
@@ -154,6 +154,46 @@ Treat a failed self-check as a blocker.
   `cancel`.
 - **Cancel:** `cancel` works on a proposed or active rollout too. Nodes that
   already upgraded stay upgraded.
+
+## 6. Web UI
+
+Every agent serves the same dashboard at `https://<node-ip>:38090/`, using
+that node's own `node.crt` and `node.key`.
+
+- **What it does:** shows rollouts, nodes, agents, locks, health and recent
+  events. You can approve, cancel or finalize an upgrade, and start a
+  rolling restart.
+- **Safety:** every action runs the same checks as the CLI.
+
+1. **Set the password once, on any node.** Run it as the agent user with
+   the env file loaded:
+
+   ```bash
+   sudo -u cockroach bash -c 'set -a; . /etc/cockroach-rollout-agent.env; cockroach-rollout-agent set-ui-password'
+   ```
+
+   - The password must be at least 12 characters.
+   - Running the command again changes the password and signs out every
+     session.
+
+2. **Trust the cluster CA in your browser.** Import the cluster's `ca.crt`
+   as a trusted authority, the same file CockroachDB clients use. Each
+   node's certificate carries its IP, so any node's URL verifies.
+
+3. **Check it.** `cockroach-rollout-agent self-check` reports `ui tls` with
+   the address and certificate it will use.
+
+- **Rolling restart:** restarts every node in turn on the version it
+  already runs. It uses the same install lease and health gate as an
+  upgrade.
+  - **When it is offered:** only when nothing else is open, every node runs
+    one version, and every node's agent is 0.1.0 or newer.
+  - **If a node does not come back:** if a node fails to rejoin within
+    `CROACH_ROLLOUT_RESTART_TIMEOUT_SECONDS`, the restart becomes `failed`
+    and halts. Investigate, then cancel it.
+- **Disabling the UI:** set `CROACH_ROLLOUT_UI_LISTEN=off`. If the
+  certificate cannot be loaded, the agent logs `ui disabled: <reason>` and
+  keeps running. It never serves plain HTTP.
 
 ## Docker
 
