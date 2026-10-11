@@ -1,7 +1,7 @@
 <!-- file: docs/superpowers/specs/2026-10-10-web-ui-design.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 8a1fc377-9402-46d9-aac1-dd7f6724861f -->
-<!-- last-edited: 2026-10-10 -->
+<!-- last-edited: 2026-10-11 -->
 
 # Built-in web UI (v1.0.0)
 
@@ -22,8 +22,11 @@ Agreed during design:
   version change.
 - The UI is served over **HTTPS with each node's existing CockroachDB node
   certificate**. Plain HTTP is never offered.
-- It is built as a **small synchronous server with server-rendered HTML
-  forms**. It uses no async runtime and no JS build step.
+- It is built with **server-rendered HTML forms and no JS build step**.
+  The HTTP server is **axum on a dedicated tokio runtime** inside the web
+  thread. The rest of the agent stays synchronous. (Amended 2026-10-11: the
+  original choice, `tiny_http`, pins rustls 0.20 for TLS, which is
+  unmaintained and fails the audit gate with RUSTSEC-2024-0336.)
 
 **Success:** the operator can take a rollout from proposal to finalize in a
 browser, and can run a rolling restart. They can do either from any node,
@@ -46,6 +49,10 @@ These were checked on the live cluster on 2026-10-10:
 - **Code style:** the agent is synchronous throughout, using blocking
   `postgres` and blocking `reqwest`. `status_command` queries and prints in
   one function.
+- **Dependency tree:** tokio, hyper, tower, http, httparse and rustls 0.23
+  (with the `ring` provider) are already compiled in through reqwest.
+- **Agent identity:** `agent_status` is keyed by `hostname:arch` and records
+  no CockroachDB node id, so agents cannot yet be matched to nodes.
 - **Audit log:** the audit log is a host-local file, so one node cannot see
   another node's audit lines.
 
@@ -58,7 +65,8 @@ systemd unit. Every agent serves the UI.
 daemon
 ├── existing tick loop (leader / follower)          unchanged control flow
 └── web thread (if CROACH_ROLLOUT_UI_LISTEN != off)
-      tiny_http + rustls  ──►  web::router
+      own tokio runtime: axum-server + rustls 0.23 (ring)  ──►  web::router
+      every DB / ops:: call runs in spawn_blocking
                                  ├── auth  (ui_auth, ui_sessions)
                                  ├── cluster_view::load()   read-only
                                  └── ops::{approve,cancel,finalize,restart_cluster}
@@ -71,22 +79,30 @@ daemon
 | `cluster_view.rs` | Loads one `ClusterView` value: rollouts, nodes, agents, leases, health snapshot and the gate verdict, plus recent events. `status` prints from it. | DB client, `health`, `rollout` |
 | `ops.rs` | `approve`, `cancel`, `finalize` and `restart_cluster` as functions that take an `Actor` (`Cli` or `Web { ip }`). These hold all the precondition checks. The CLI subcommands become thin wrappers. | DB client, `rollout`, events |
 | `events.rs` | `record_event(client, source, kind, detail)` inserts into the cluster-wide `events` table. Called next to the existing `audit()` calls wherever a DB client is in hand. | DB client |
-| `web/mod.rs` | Server startup: TLS config, listener, request loop, panic isolation. | tiny_http, rustls |
-| `web/auth.rs` | Password hashing and verification (argon2id), sessions, CSRF tokens, the per-IP failure counter. | argon2, rand, sha2 |
+| `web/mod.rs` | Server startup: builds the tokio runtime, binds the listener, serves the router with TLS, isolates panics. Defines the `Backend` trait (auth store, view, ops) that the router calls. | axum, axum-server, tokio |
+| `web/auth.rs` | Password hashing and verification (argon2id), sessions, CSRF tokens, the per-IP failure counter. | argon2, rand, sha2, subtle |
 | `web/routes.rs` | Request handlers for `/login`, `/`, `/logout` and the action POSTs. | auth, cluster_view, ops |
 | `web/render.rs` | HTML templates as Rust functions with mandatory escaping. Also the small CSS and inline-free JS assets. | — |
-| `web/tls.rs` | Resolves the certs dir from the unit and loads `node.crt` and `node.key`. | systemctl |
+| `web/tls.rs` | Resolves the certs dir from the unit and loads `node.crt` and `node.key` into a rustls `ServerConfig`. | systemctl, rustls |
 
 `main.rs` loses `status_command`'s query code and the bodies of
 approve, cancel and finalize to these modules.
 
 ### New dependencies
 
-- `tiny_http` with the `ssl-rustls` feature;
-- `argon2`;
-- `rand`;
-- `rustls-pemfile`;
-- dev-only: `rcgen`, to create test certificates.
+- `axum` 0.8, with default features off and `http1`, `tokio`, `form` and
+  `query` on;
+- `axum-server` 0.8, with only `tls-rustls-no-provider`, so aws-lc-rs is
+  never compiled in;
+- `rustls` 0.23 with `ring`, already in the tree; PEM parsing uses its
+  `pki_types::pem::PemObject`;
+- `tokio` 1, with `rt-multi-thread`, `net`, `time` and `macros`;
+- `tower-http` 0.6, for `CatchPanicLayer`;
+- `argon2` 0.6, `rand` 0.10 and `subtle` 2.6;
+- `rpassword` 7, for the no-echo prompt in `set-ui-password`;
+- dev-only: `rcgen` 0.14, to create test certificates.
+
+All of these fit the existing `rust-version = 1.87`.
 
 ## Configuration
 
@@ -127,7 +143,13 @@ CREATE TABLE events (
 
 ALTER TABLE rollouts ADD COLUMN IF NOT EXISTS kind STRING NOT NULL DEFAULT 'upgrade';  -- upgrade | restart
 ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS restarted_rollout_id STRING NULL;
+ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS node_id INT8 NULL;         -- crdb_internal.node_id(), written on heartbeat
+ALTER TABLE agent_status ADD COLUMN IF NOT EXISTS agent_version STRING NULL; -- CARGO_PKG_VERSION, written on heartbeat
 ```
+
+- **Restart rows:** a restart stores a `RolloutManifest` like any rollout,
+  with `current_version = target_version`, no artifacts and no warnings.
+  This keeps `manifest_json` NOT NULL and `open_rollout` unchanged in shape.
 
 - **Expired sessions:** the leader deletes expired `ui_sessions` rows on
   each tick.
@@ -239,26 +261,42 @@ target_version =` the uniform cluster version.
   and `approved_by` set to the actor, because starting it is the operator's
   approval. It refuses when any rollout is open, or when the cluster is not
   live on one version.
+- **Branching on kind.** `open_rollout` returns `kind`. Both the leader's
+  and the follower's reconcile branch on it **before** any upgrade logic.
+  Because `from == to`, the upgrade path would otherwise call the restart
+  already complete on the first tick: the leader would see every node on
+  the target, and each follower would see itself on the target. A restart
+  never reaches artifact download, the binary swap or the finalize branches.
+- **Version guard.** `ops::restart_cluster` refuses unless every live node
+  has an agent row whose `agent_version` is at least the first
+  restart-capable release, 0.1.0. The error names the agents that are
+  missing or too old. Older agents ignore `kind`, and would end the restart
+  without restarting anything.
 - **Follower.** This is a new pure function, `restart_action(rollout_id,
   restarted_rollout_id) -> {AlreadyRestarted, Restart}`.
   - On `Restart`, the follower takes the install lease, passes
-    `safe_to_restart`, runs `systemctl restart <service>`, and waits with
-    the existing `HealthWaiter` for the node to be active on the same
-    version.
+    `safe_to_restart`, records the node's `started_at` from
+    `crdb_internal.gossip_nodes`, runs `systemctl restart <service>`, and
+    waits for the node to be live on the same version **with a newer
+    `started_at`**. Without that last check, gossip from before the restart
+    could pass.
   - It then sets `agent_status.restarted_rollout_id = id`, records a
     `restarted` event, and releases the lease.
   - If the node does not rejoin before `restart_timeout`, the follower
     sets the rollout to `failed`, writes the error to `rollouts.error` and
     `agent_status.error`, and releases the lease. This is the same terminal
     path a failed upgrade takes. There is no binary to roll back.
-- **Leader.** This is a new pure function, `restart_complete(live_agents,
-  live_nodes, rollout_id) -> bool`. It returns true only when every live
-  node has an agent whose `restarted_rollout_id` equals the rollout id.
+- **Leader.** This is a new pure function, `restart_complete(agents, nodes,
+  rollout_id) -> bool`. It returns true only when every active node is live
+  and has an agent, matched by `agent_status.node_id`, whose
+  `restarted_rollout_id` equals the rollout id.
   When it is true, the leader sets `status = 'finalized'`, the existing
   terminal success state. A restart never touches
   `preserve_downgrade_option`.
 - **Errors.** A `failed` restart halts, like a failed upgrade. No follower
   acts on it, and the operator cancels it to clear it.
+- **Finalize scope.** `ops::finalize` acts only on an open rollout of kind
+  `upgrade`.
 - **Exclusivity.** At most one open rollout of either kind. This is
   enforced in `ops::` and by the leader's proposal logic, which already
   skips proposing while a rollout is open.
@@ -267,7 +305,7 @@ target_version =` the uniform cluster version.
 
 | Failure | Behavior |
 |---|---|
-| The web thread fails to bind or panics | Log it. The daemon loop continues, because rollouts never depend on the UI. A panicking handler is caught per request with `catch_unwind` and returns 500. |
+| The web thread fails to bind or panics | Log it. The daemon loop continues, because rollouts never depend on the UI. A panicking handler returns 500, through `CatchPanicLayer` or the `spawn_blocking` `JoinError`. |
 | DB unreachable while rendering | The dashboard shows a "database unreachable: <error>" banner and no stale data. Every POST is refused. |
 | An `ops::` precondition fails | The flash shows the exact error, the same text as the CLI. |
 | Session expired mid-form | Redirect to `/login`. The form is not replayed. |
@@ -288,9 +326,9 @@ target_version =` the uniform cluster version.
   containing `<script>` comes out escaped;
 - the per-IP failure counter: lockout after 5, and reset after 60 seconds.
 
-**An HTTPS integration test** starts the web server on `127.0.0.1:0` with
-an `rcgen` certificate and a stubbed store trait for sessions and auth. It
-asserts:
+**An HTTPS integration test** lives in-crate under `web/`, because the
+crate is bin-only. It starts the web server on `127.0.0.1:0` with an
+`rcgen` certificate and an in-memory `Backend`, then asserts:
 
 - `GET /` without a session redirects to `/login`;
 - a wrong password returns 401, and the 6th attempt returns 429;
