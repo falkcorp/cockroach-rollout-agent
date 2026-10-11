@@ -1,7 +1,7 @@
 <!-- file: docs/security.md -->
-<!-- version: 2.2.0 -->
+<!-- version: 2.3.0 -->
 <!-- guid: b1107208-a9c3-4018-9e86-a44cbf5c7f79 -->
-<!-- last-edited: 2026-10-10 -->
+<!-- last-edited: 2026-10-11 -->
 
 # Security Model
 
@@ -45,6 +45,32 @@ The rollout agent must be treated as privileged infrastructure automation.
   coordination database and the `VIEWCLUSTERMETADATA` and
   `MODIFYCLUSTERSETTING` system privileges. The node certificate is not
   reused: it authenticates as `node`, which is effectively root.
+
+## Web UI
+
+- **Scope:** one shared operator password, intended for a trusted LAN.
+  There are no accounts or roles.
+- **Password storage:** the password is stored only as an argon2id hash
+  in `<schema>.ui_auth`.
+- **Sessions:** the session cookie `crra_session` is `Secure`, `HttpOnly`
+  and `SameSite=Strict`, and lasts `CROACH_ROLLOUT_UI_SESSION_HOURS`. The
+  database stores only the cookie's SHA-256.
+- **CSRF:** every state-changing form carries a per-session CSRF token,
+  compared in constant time. A mismatch returns 403 and records a
+  `csrf_rejected` event.
+- **TLS:** TLS 1.2 or 1.3, using the node's own CockroachDB certificate.
+  The UI never serves plain HTTP.
+- **Security headers:** `Content-Security-Policy` (`default-src 'self'`,
+  no framing), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+  `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
+- **Lockout:** after 5 failed logins from one IP within 60 seconds, that
+  node answers 429 for the rest of the minute.
+  - The counter is in memory on each node, so it is a speed bump, not a
+    cluster-wide lockout.
+  - Use a long password.
+- **Event log:** logins, CSRF rejections, password changes and every
+  action are recorded in the cluster-wide `<schema>.events` table, as well
+  as each host's audit log.
 
 ## Audit Events
 

@@ -1,7 +1,7 @@
 <!-- file: README.md -->
-<!-- version: 4.1.0 -->
+<!-- version: 4.2.0 -->
 <!-- guid: c68a62ce-72d1-45cc-a6c8-d3dfc41d0e34 -->
-<!-- last-edited: 2026-10-10 -->
+<!-- last-edited: 2026-10-11 -->
 
 # cockroach-rollout-agent
 
@@ -54,6 +54,8 @@ cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" daemon --dry-run
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" status
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" approve v25.4.1
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" cancel --reason "..."
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" restart-cluster
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" set-ui-password
 ```
 
 ## Linux Self Install
@@ -94,6 +96,9 @@ Code Quality is enabled for the repository or account during the public preview.
 | `CROACH_ROLLOUT_AGENT_ROOT` | `/var/lib/cockroach-rollout-agent` |
 | `CROACH_ROLLOUT_RESTART_TIMEOUT_SECONDS` | `600` |
 | `CROACH_ROLLOUT_AUTO_FINALIZE` | unset (operator runs `finalize`) |
+| `CROACH_ROLLOUT_UI_LISTEN` | `0.0.0.0:38090` (`off` disables the web UI) |
+| `CROACH_ROLLOUT_UI_CERTS_DIR` | unset (the CockroachDB unit's `--certs-dir`) |
+| `CROACH_ROLLOUT_UI_SESSION_HOURS` | `12` |
 | `CROACH_ROLLOUT_AUDIT_LOG` | `/var/log/cockroach-rollout-agent/audit.log` |
 | `CROACH_ROLLOUT_DATABASE_URL` | unset |
 | `CROACH_ROLLOUT_SCHEMA` | `cockroach_rollout` |
