@@ -8,6 +8,65 @@ and this project adheres to
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-v0.1.0'></a>
+## v0.1.0 — 2026-10-11
+
+### Added
+
+#### Pull request template with agent instructions
+
+`.github/pull_request_template.md` gives every PR the same sections: summary,
+changes, invariants touched, test plan, risk and a checklist.
+
+It also carries HTML-comment instructions, invisible once the PR renders.
+They spell out, for AI agents and humans:
+
+- the commit-title format and file-header rules;
+- the changelog and TODO fragment workflow;
+- the local gates to run before opening;
+- the rollout and web-UI invariants a change must preserve;
+- how to merge.
+
+#### Built-in web UI
+
+Every agent now serves an HTTPS dashboard on port 38090, using its node's
+own CockroachDB certificate.
+
+- **Dashboard:** it shows rollouts, nodes, agents, locks, health and the
+  newest cluster events.
+- **Actions:** approve, cancel and finalize an upgrade, or start a rolling
+  restart, with the same checks as the CLI.
+- **Access:** one shared password, set with
+  `cockroach-rollout-agent set-ui-password`. It is stored as an argon2id
+  hash. Sessions use strict cookies, every form carries a CSRF token, and
+  failed logins are throttled per IP.
+- **No HTTP fallback:** when the certificate cannot be loaded, the UI is
+  off and the agent keeps running.
+
+#### Rolling restart
+
+A new `restart-cluster` command, also available in the UI, restarts every
+node in turn on its current version. It uses the install lease and the
+health gate of an upgrade.
+
+- **When it finishes:** only when gossip shows each node with a newer
+  start time.
+- **When it is refused:** while any rollout is open, when nodes run
+  different versions, or when any node's agent predates 0.1.0.
+
+#### Cluster-wide event log
+
+Agents, the CLI and the UI write key events to `<schema>.events`, keeping
+the newest 500. Any node's dashboard can therefore see what every agent
+did, which the host-local audit log cannot show.
+
+### Changed
+
+- **`status`:** now also shows each rollout's kind.
+- **Agent heartbeats:** record the node id and the agent version.
+- **Leader proposals:** no longer open a second rollout if one appeared
+  while artifacts were downloading.
+
 <a id='changelog-v0.0.3'></a>
 ## v0.0.3 — 2026-10-10
 
