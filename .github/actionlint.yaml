@@ -1,6 +1,13 @@
 # file: .github/actionlint.yaml
-# version: 1.0.0
+# version: 1.1.0
 # guid: 841a5ce7-f307-45f6-9c38-19a839c1975d
+# last-edited: 2026-10-11
+
+# The reusable CI pins actionlint v1.7.1, which predates GitHub's hosted
+# arm64 runner label used by release-assets.yml.
+self-hosted-runner:
+  labels:
+    - ubuntu-24.04-arm
 
 paths:
   .github/workflows/coverage.yml:
