@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 3.6.0
+// version: 3.7.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-11
 
@@ -7,6 +7,7 @@ mod cluster_view;
 mod events;
 mod health;
 mod layout;
+mod ops;
 mod rollout;
 
 use std::ffi::OsStr;
@@ -30,6 +31,7 @@ use thiserror::Error;
 use crate::events::Source;
 use crate::health::{ClusterHealth, safe_to_restart};
 use crate::layout::{BinaryLayout, probe_writable};
+use crate::ops::Actor;
 use crate::rollout::{
     FollowerAction, LeaderAction, NodeObservation, RolloutKind, RolloutStatus, all_nodes_on,
     follower_action, leader_action, live_version_span,
@@ -233,6 +235,10 @@ enum Commands {
         reason: String,
     },
 
+    /// Restart every node, one at a time, on the version it already runs.
+    /// Same install lease and health gate as an upgrade.
+    RestartCluster,
+
     /// Show rollouts, cluster nodes, agents, and lease holders.
     Status,
 
@@ -401,6 +407,7 @@ fn run() -> Result<(), AppError> {
             accept_release_note_warnings,
         } => approve_command(&cli, version, *accept_release_note_warnings),
         Commands::Cancel { reason } => cancel_command(&cli, reason),
+        Commands::RestartCluster => restart_cluster_command(&cli),
         Commands::Status => status_command(&cli),
         Commands::InitDb => init_db_command(&cli),
         Commands::Discover => discover_command(&cli),
@@ -1184,69 +1191,17 @@ fn approve_command(
     version: &str,
     accept_release_note_warnings: bool,
 ) -> Result<(), AppError> {
-    let target = parse_cockroach_version(version)?;
     let mut client = db_client(cli)?;
     ensure_schema(cli, &mut client)?;
-    let rollout = open_rollout(cli, &mut client)?
-        .ok_or_else(|| AppError::Message("there is no proposed rollout".to_string()))?;
-    if rollout.status != RolloutStatus::Proposed {
-        return Err(AppError::Message(format!(
-            "the open rollout to {} is {}, not proposed",
-            rollout.manifest.target_version, rollout.status
-        )));
-    }
-    if rollout.manifest.target_version != target {
-        return Err(AppError::Message(format!(
-            "the proposal targets {}, not {target}",
-            rollout.manifest.target_version
-        )));
-    }
-    if !rollout.manifest.release_note_warnings.is_empty() && !accept_release_note_warnings {
-        return Err(AppError::Message(format!(
-            "release notes matched {:?}; review {} and rerun with --accept-release-note-warnings",
-            rollout.manifest.release_note_warnings, rollout.manifest.release_notes_url
-        )));
-    }
-
-    if rollout.requires_finalization() {
-        // Without this, CockroachDB finalizes on its own the moment the last
-        // node restarts, and the downgrade window closes before anyone looks.
-        let line = major_line_string(&rollout.manifest.current_version);
-        client.batch_execute(&format!(
-            "SET CLUSTER SETTING cluster.preserve_downgrade_option = '{line}'"
-        ))?;
-    }
-
-    let mut manifest = rollout.manifest;
-    manifest.release_note_warnings_approved = accept_release_note_warnings;
-    let schema = sql_ident(&cli.schema)?;
-    let approver = std::env::var("USER").unwrap_or_else(|_| agent_node_id(cli).unwrap_or_default());
-    let updated = client.execute(
-        &format!(
-            "
-            UPDATE {schema}.rollouts
-            SET status = 'active', approved_by = $2, approved_at = now(), manifest_json = $3
-            WHERE id::STRING = $1 AND status = 'proposed'
-            "
-        ),
-        &[&rollout.id, &approver, &serde_json::to_string(&manifest)?],
-    )?;
-    if updated != 1 {
-        return Err(AppError::Message(
-            "the proposal changed while approving; rerun status".to_string(),
-        ));
-    }
-    audit(
-        cli,
-        "rollout_approved",
-        &format!(
-            "current={} target={} by={approver}",
-            manifest.current_version, manifest.target_version
-        ),
-    )?;
     println!(
-        "approved {} -> {}; agents will upgrade one node at a time",
-        manifest.current_version, manifest.target_version
+        "{}",
+        ops::approve(
+            cli,
+            &mut client,
+            &Actor::Cli,
+            version,
+            accept_release_note_warnings
+        )?
     );
     Ok(())
 }
@@ -1254,32 +1209,14 @@ fn approve_command(
 fn cancel_command(cli: &Cli, reason: &str) -> Result<(), AppError> {
     let mut client = db_client(cli)?;
     ensure_schema(cli, &mut client)?;
-    let Some(rollout) = open_rollout(cli, &mut client)? else {
-        println!("no open rollout");
-        return Ok(());
-    };
-    set_rollout_status(
-        cli,
-        &mut client,
-        &rollout.id,
-        RolloutStatus::Cancelled,
-        Some(reason),
-    )?;
-    audit(
-        cli,
-        "rollout_cancelled",
-        &format!("target={} reason={reason}", rollout.manifest.target_version),
-    )?;
-    println!(
-        "cancelled {} rollout to {}",
-        rollout.status, rollout.manifest.target_version
-    );
-    if rollout.status != RolloutStatus::Proposed && rollout.requires_finalization() {
-        println!(
-            "cluster.preserve_downgrade_option is still set, so already-upgraded nodes can be \
-             rolled back; RESET it only once every node runs one version"
-        );
-    }
+    println!("{}", ops::cancel(cli, &mut client, &Actor::Cli, reason)?);
+    Ok(())
+}
+
+fn restart_cluster_command(cli: &Cli) -> Result<(), AppError> {
+    let mut client = db_client(cli)?;
+    ensure_schema(cli, &mut client)?;
+    println!("{}", ops::restart_cluster(cli, &mut client, &Actor::Cli)?);
     Ok(())
 }
 
@@ -1914,37 +1851,12 @@ fn service_name(cli: &Cli) -> Result<&str, AppError> {
 }
 
 fn finalize_command(cli: &Cli, target_version: &str, dry_run: bool) -> Result<(), AppError> {
-    let version = parse_cockroach_version(target_version)?;
-    reject_prerelease(&version)?;
     let mut client = db_client(cli)?;
-
-    let nodes = cluster_nodes(&mut client)?;
-    if !all_nodes_on(&version, &nodes) {
-        return Err(AppError::Message(format!(
-            "refusing to finalize: not every node is live on {version}; see status"
-        )));
-    }
-    if dry_run {
-        println!(
-            "dry run: RESET CLUSTER SETTING cluster.preserve_downgrade_option; \
-             SET CLUSTER SETTING version = '{}'",
-            major_line_string(&version)
-        );
-        return Ok(());
-    }
-
-    finalize_cluster(cli, &mut client, &version)?;
-    if let Some(rollout) =
-        open_rollout(cli, &mut client)?.filter(|rollout| rollout.manifest.target_version == version)
-    {
-        set_rollout_status(
-            cli,
-            &mut client,
-            &rollout.id,
-            RolloutStatus::Finalized,
-            None,
-        )?;
-    }
+    ensure_schema(cli, &mut client)?;
+    println!(
+        "{}",
+        ops::finalize(cli, &mut client, &Actor::Cli, target_version, dry_run)?
+    );
     Ok(())
 }
 
