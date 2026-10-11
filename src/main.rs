@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 3.12.0
+// version: 3.13.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-11
 
@@ -832,7 +832,23 @@ fn leader_restart(
     if rollout.status != RolloutStatus::Active {
         return Ok(());
     }
-    let agents = cluster_view::agent_observations(cli, client)?;
+    let rows = cluster_view::agent_rows(cli, client)?;
+    let lease_seconds = cli.restart_timeout_seconds + INSTALL_LEASE_EXTRA_SECONDS;
+    if let Some(stalled) = cluster_view::stalled_restart(&rows, &rollout.id, lease_seconds) {
+        let reason = format!(
+            "{}: node did not come back from its restart within {lease_seconds}s",
+            stalled.observation.agent_id
+        );
+        if dry_run {
+            println!("dry run: would fail restart {}: {reason}", rollout.id);
+            return Ok(());
+        }
+        if fail_rollout_if_active(cli, client, &rollout.id, &reason)? {
+            events::note(cli, client, Source::Agent, "restart_failed", &reason)?;
+        }
+        return Ok(());
+    }
+    let agents: Vec<_> = rows.into_iter().map(|row| row.observation).collect();
     let complete = restart_complete(&agents, nodes, &rollout.id);
     if dry_run {
         println!("dry run: restart {} complete={complete}", rollout.id);
@@ -1132,8 +1148,11 @@ fn follower_restart(
     let outcome = run_systemctl("restart", service)
         .and_then(|()| wait_for_restart(cli, &running, started_before, timeout));
 
-    // The node restarted, so the old connection is gone.
-    *client = reconnect(cli)?;
+    // The node restarted, so the old connection is gone. The agent's DB is
+    // its own node, so wait for it however long it takes: giving up here
+    // would leave the outcome unrecorded. The leader marks the rollout
+    // failed meanwhile if this outlives the install lease.
+    *client = reconnect_patiently(cli);
     match outcome {
         Ok(()) => {
             mark_restarted(cli, client, agent_id, &rollout.id)?;
@@ -1157,13 +1176,7 @@ fn follower_restart(
         }
         Err(error) => {
             let message = error.to_string();
-            set_rollout_status(
-                cli,
-                client,
-                &rollout.id,
-                RolloutStatus::Failed,
-                Some(&format!("{agent_id}: {message}")),
-            )?;
+            fail_rollout_if_active(cli, client, &rollout.id, &format!("{agent_id}: {message}"))?;
             record_agent_state(
                 cli,
                 client,
@@ -1358,6 +1371,23 @@ fn upgrade_node(
                 "upgrade to {target} failed ({error}) and rollback to {from} also failed \
                  ({rollback_error}); node needs attention"
             )))
+        }
+    }
+}
+
+/// Like `reconnect`, but never gives up; logs every minute while waiting.
+fn reconnect_patiently(cli: &Cli) -> Client {
+    let mut attempts: u64 = 0;
+    loop {
+        match db_client(cli) {
+            Ok(client) => return client,
+            Err(error) => {
+                if attempts.is_multiple_of(60 / HEALTH_POLL_SECONDS) {
+                    eprintln!("waiting for the local node to accept SQL again: {error}");
+                }
+                attempts += 1;
+                thread::sleep(Duration::from_secs(HEALTH_POLL_SECONDS));
+            }
         }
     }
 }
@@ -1981,6 +2011,26 @@ fn open_rollout(cli: &Cli, client: &mut Client) -> Result<Option<OpenRollout>, A
         status: status.parse().map_err(AppError::Message)?,
         manifest: serde_json::from_str(&manifest_json)?,
     }))
+}
+
+/// Marks `id` failed only while it is still active, so a late failure never
+/// reopens a rollout an operator cancelled or a leader already failed.
+/// Returns whether this call made the change.
+fn fail_rollout_if_active(
+    cli: &Cli,
+    client: &mut Client,
+    id: &str,
+    error: &str,
+) -> Result<bool, AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    let updated = client.execute(
+        &format!(
+            "UPDATE {schema}.rollouts SET status = 'failed', error = $2 \
+             WHERE id::STRING = $1 AND status = 'active'"
+        ),
+        &[&id, &error],
+    )?;
+    Ok(updated == 1)
 }
 
 fn set_rollout_status(

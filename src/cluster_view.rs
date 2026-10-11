@@ -1,5 +1,5 @@
 // file: src/cluster_view.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: b65f6d37-171d-4be5-8fbc-306d362e20c2
 // last-edited: 2026-10-11
 
@@ -82,6 +82,8 @@ pub struct AgentRow {
     pub state: String,
     pub version: String,
     pub error: Option<String>,
+    /// The rollout `state` refers to.
+    pub rollout_id: Option<String>,
     /// Seconds since the agent's last heartbeat.
     pub age_secs: i64,
 }
@@ -194,7 +196,7 @@ pub fn load(cli: &Cli, client: &mut Client) -> Result<ClusterView, AppError> {
     })
 }
 
-fn agent_rows(cli: &Cli, client: &mut Client) -> Result<Vec<AgentRow>, AppError> {
+pub fn agent_rows(cli: &Cli, client: &mut Client) -> Result<Vec<AgentRow>, AppError> {
     let schema = sql_ident(&cli.schema)?;
     Ok(client
         .query(
@@ -202,7 +204,7 @@ fn agent_rows(cli: &Cli, client: &mut Client) -> Result<Vec<AgentRow>, AppError>
                 "
                 SELECT agent_id, state, version, error,
                        extract(epoch FROM now() - coalesce(last_seen, updated_at))::INT8,
-                       node_id, agent_version, restarted_rollout_id
+                       node_id, agent_version, restarted_rollout_id, rollout_id
                 FROM {schema}.agent_status
                 ORDER BY agent_id
                 "
@@ -220,9 +222,26 @@ fn agent_rows(cli: &Cli, client: &mut Client) -> Result<Vec<AgentRow>, AppError>
             state: row.get(1),
             version: row.get(2),
             error: row.get(3),
+            rollout_id: row.get(8),
             age_secs: row.get(4),
         })
         .collect())
+}
+
+/// The agent stuck in `restarting` for this rollout longer than `limit_secs`.
+/// An agent blocks while its node restarts and stops heartbeating, so once
+/// its install lease would have expired, its node is not coming back on its
+/// own and the restart has failed even though nothing could record it.
+pub fn stalled_restart<'a>(
+    agents: &'a [AgentRow],
+    rollout_id: &str,
+    limit_secs: u64,
+) -> Option<&'a AgentRow> {
+    agents.iter().find(|agent| {
+        agent.state == "restarting"
+            && agent.rollout_id.as_deref() == Some(rollout_id)
+            && agent.age_secs > limit_secs as i64
+    })
 }
 
 pub fn agent_observations(
@@ -261,6 +280,7 @@ impl ClusterView {
                     state: "idle".to_string(),
                     version: version.to_string(),
                     error: None,
+                    rollout_id: None,
                     age_secs: 10,
                 })
                 .collect(),
@@ -354,5 +374,28 @@ mod tests {
         assert!(!agent.is_stale(900));
         agent.age_secs = 901;
         assert!(agent.is_stale(900));
+    }
+
+    #[test]
+    fn a_restart_that_outlives_its_lease_is_stalled() {
+        let mut agents = ClusterView::sample().agents;
+        agents[1].state = "restarting".to_string();
+        agents[1].rollout_id = Some("r1".to_string());
+        agents[1].age_secs = 1_500;
+        assert!(
+            stalled_restart(&agents, "r1", 1_500).is_none(),
+            "at the limit"
+        );
+        agents[1].age_secs = 1_501;
+        assert_eq!(
+            stalled_restart(&agents, "r1", 1_500).map(|agent| agent.observation.agent_id.as_str()),
+            Some("host2:amd64")
+        );
+        assert!(
+            stalled_restart(&agents, "r0", 1_500).is_none(),
+            "another rollout's restart is not this one's"
+        );
+        agents[1].state = "complete".to_string();
+        assert!(stalled_restart(&agents, "r1", 1_500).is_none());
     }
 }
