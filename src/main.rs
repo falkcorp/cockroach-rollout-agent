@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 3.7.0
+// version: 3.8.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-11
 
@@ -33,8 +33,9 @@ use crate::health::{ClusterHealth, safe_to_restart};
 use crate::layout::{BinaryLayout, probe_writable};
 use crate::ops::Actor;
 use crate::rollout::{
-    FollowerAction, LeaderAction, NodeObservation, RolloutKind, RolloutStatus, all_nodes_on,
-    follower_action, leader_action, live_version_span,
+    FollowerAction, LeaderAction, NodeObservation, RestartAction, RolloutKind, RolloutStatus,
+    all_nodes_on, follower_action, leader_action, live_version_span, restart_action,
+    restart_complete, restarted_on,
 };
 
 const DEFAULT_BASE_URL: &str = "https://binaries.cockroachdb.com";
@@ -738,6 +739,12 @@ fn leader_reconcile(
 ) -> Result<(), AppError> {
     let open = open_rollout(cli, client)?;
     let nodes = cluster_nodes(client)?;
+    if let Some(rollout) = open
+        .as_ref()
+        .filter(|rollout| rollout.kind == RolloutKind::Restart)
+    {
+        return leader_restart(cli, client, rollout, &nodes, dry_run);
+    }
     let complete = open
         .as_ref()
         .is_some_and(|rollout| all_nodes_on(&rollout.manifest.target_version, &nodes));
@@ -785,6 +792,41 @@ fn leader_reconcile(
             )
         }
     }
+}
+
+/// A restart has nothing to propose or finalize; it ends once every live
+/// node's agent has recorded it.
+fn leader_restart(
+    cli: &Cli,
+    client: &mut Client,
+    rollout: &OpenRollout,
+    nodes: &[NodeObservation],
+    dry_run: bool,
+) -> Result<(), AppError> {
+    if rollout.status != RolloutStatus::Active {
+        return Ok(());
+    }
+    let agents = cluster_view::agent_observations(cli, client)?;
+    let complete = restart_complete(&agents, nodes, &rollout.id);
+    if dry_run {
+        println!("dry run: restart {} complete={complete}", rollout.id);
+        return Ok(());
+    }
+    if complete {
+        set_rollout_status(cli, client, &rollout.id, RolloutStatus::Finalized, None)?;
+        events::note(
+            cli,
+            client,
+            Source::Agent,
+            "restart_complete",
+            &format!(
+                "version={} nodes={}",
+                rollout.manifest.target_version,
+                nodes.len()
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 /// Records the next release-line step as a `proposed` rollout. Nothing
@@ -844,6 +886,9 @@ fn follower_reconcile(
         }
         return Ok(());
     };
+    if rollout.kind == RolloutKind::Restart {
+        return follower_restart(cli, client, agent_id, &rollout, dry_run);
+    }
     let manifest = &rollout.manifest;
     let running = own_node_version(client)?;
 
@@ -912,11 +957,7 @@ fn follower_reconcile(
         );
     }
 
-    // Fail closed: if health cannot be measured, it is not known to be safe.
-    let verdict = cluster_health(client)
-        .map_err(|error| format!("could not measure cluster health: {error}"))
-        .and_then(|health| safe_to_restart(&health));
-    if let Err(reason) = verdict {
+    if let Err(reason) = health_verdict(client) {
         record_agent_state(
             cli,
             client,
@@ -987,6 +1028,126 @@ fn follower_reconcile(
                 Some(&message),
             )?;
             events::note(cli, client, Source::Agent, "upgrade_failed", &message)?;
+            release_lease(cli, client, INSTALL_LEASE, agent_id)?;
+            Err(error)
+        }
+    }
+}
+
+/// Restarts this node once per restart rollout, under the install lease and
+/// health gate. Nothing is swapped, so failure has nothing to roll back: the
+/// rollout halts as `failed` for an operator, like a failed upgrade.
+fn follower_restart(
+    cli: &Cli,
+    client: &mut Client,
+    agent_id: &str,
+    rollout: &OpenRollout,
+    dry_run: bool,
+) -> Result<(), AppError> {
+    let restarted = restarted_rollout_id(cli, client, agent_id)?;
+    if restart_action(&rollout.id, restarted.as_deref()) == RestartAction::AlreadyRestarted {
+        if !dry_run {
+            release_lease(cli, client, INSTALL_LEASE, agent_id)?;
+        }
+        return Ok(());
+    }
+    let running = own_node_version(client)?;
+    if dry_run {
+        println!("dry run: would take the install lease and restart this node on {running}");
+        return Ok(());
+    }
+
+    let service = service_name(cli)?;
+    let lease_seconds = cli.restart_timeout_seconds + INSTALL_LEASE_EXTRA_SECONDS;
+    let lease = acquire_lease(cli, client, INSTALL_LEASE, agent_id, lease_seconds)?;
+    if !lease.is_leader {
+        return record_agent_state(
+            cli,
+            client,
+            agent_id,
+            "queued",
+            &running,
+            &rollout.id,
+            Some(&format!("install lease held by {}", lease.holder_id)),
+        );
+    }
+    if let Err(reason) = health_verdict(client) {
+        record_agent_state(
+            cli,
+            client,
+            agent_id,
+            "waiting_for_health",
+            &running,
+            &rollout.id,
+            Some(&reason),
+        )?;
+        events::note(cli, client, Source::Agent, "gate_wait", &reason)?;
+        return release_lease(cli, client, INSTALL_LEASE, agent_id);
+    }
+
+    record_agent_state(
+        cli,
+        client,
+        agent_id,
+        "restarting",
+        &running,
+        &rollout.id,
+        None,
+    )?;
+    let started_before = own_started_at(client)?;
+    events::note(
+        cli,
+        client,
+        Source::Agent,
+        "restart_begin",
+        &format!("service={service} version={running}"),
+    )?;
+    let timeout = Duration::from_secs(cli.restart_timeout_seconds);
+    let outcome = run_systemctl("restart", service)
+        .and_then(|()| wait_for_restart(cli, &running, started_before, timeout));
+
+    // The node restarted, so the old connection is gone.
+    *client = reconnect(cli)?;
+    match outcome {
+        Ok(()) => {
+            mark_restarted(cli, client, agent_id, &rollout.id)?;
+            record_agent_state(
+                cli,
+                client,
+                agent_id,
+                "complete",
+                &running,
+                &rollout.id,
+                None,
+            )?;
+            events::note(
+                cli,
+                client,
+                Source::Agent,
+                "restarted",
+                &format!("version={running}"),
+            )?;
+            release_lease(cli, client, INSTALL_LEASE, agent_id)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            set_rollout_status(
+                cli,
+                client,
+                &rollout.id,
+                RolloutStatus::Failed,
+                Some(&format!("{agent_id}: {message}")),
+            )?;
+            record_agent_state(
+                cli,
+                client,
+                agent_id,
+                "failed",
+                &running,
+                &rollout.id,
+                Some(&message),
+            )?;
+            events::note(cli, client, Source::Agent, "restart_failed", &message)?;
             release_lease(cli, client, INSTALL_LEASE, agent_id)?;
             Err(error)
         }
@@ -1574,6 +1735,88 @@ fn own_node_observation(client: &mut Client) -> Result<NodeObservation, AppError
     Ok(node_observation_from_row(&row))
 }
 
+/// This node's process start time in microseconds, from gossip. Changes on
+/// every restart, so it tells a fresh observation from a stale one.
+fn own_started_at(client: &mut Client) -> Result<i64, AppError> {
+    let row = client.query_one(
+        "
+        SELECT (extract(epoch FROM started_at) * 1000000)::INT8
+        FROM crdb_internal.gossip_nodes
+        WHERE node_id = crdb_internal.node_id()
+        ",
+        &[],
+    )?;
+    Ok(row.get(0))
+}
+
+fn restarted_rollout_id(
+    cli: &Cli,
+    client: &mut Client,
+    agent_id: &str,
+) -> Result<Option<String>, AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    let rows = client.query(
+        &format!("SELECT restarted_rollout_id FROM {schema}.agent_status WHERE agent_id = $1"),
+        &[&agent_id],
+    )?;
+    Ok(rows.first().and_then(|row| row.get::<_, Option<String>>(0)))
+}
+
+fn mark_restarted(
+    cli: &Cli,
+    client: &mut Client,
+    agent_id: &str,
+    rollout_id: &str,
+) -> Result<(), AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    client.execute(
+        &format!("UPDATE {schema}.agent_status SET restarted_rollout_id = $2 WHERE agent_id = $1"),
+        &[&agent_id, &rollout_id],
+    )?;
+    Ok(())
+}
+
+/// Waits until this node is live on `expected` with a start time newer than
+/// `started_before`. Reconnects each poll because the node went away.
+fn wait_for_restart(
+    cli: &Cli,
+    expected: &Version,
+    started_before: i64,
+    timeout: Duration,
+) -> Result<(), AppError> {
+    let deadline = SystemTime::now() + timeout;
+    let mut last = String::from("no observation yet");
+    while SystemTime::now() < deadline {
+        thread::sleep(Duration::from_secs(HEALTH_POLL_SECONDS));
+        let observed = db_client(cli).and_then(|mut client| {
+            Ok((
+                own_node_observation(&mut client)?,
+                own_started_at(&mut client)?,
+            ))
+        });
+        match observed {
+            Ok((node, started)) if restarted_on(expected, started_before, &node, started) => {
+                return Ok(());
+            }
+            Ok((node, started)) => {
+                last = format!(
+                    "node {} live={} version={} started_at_us={started} (before {started_before})",
+                    node.node_id,
+                    node.is_live,
+                    node.version
+                        .map(|version| version.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+            }
+            Err(error) => last = error.to_string(),
+        }
+    }
+    Err(AppError::Message(format!(
+        "node did not restart on {expected} within {}s; last: {last}",
+        timeout.as_secs()
+    )))
+}
+
 /// The version the local CockroachDB process is actually running, which can
 /// differ from the file on disk if a swap happened without a restart.
 fn own_node_version(client: &mut Client) -> Result<Version, AppError> {
@@ -1593,6 +1836,13 @@ fn node_observation_from_row(row: &postgres::Row) -> NodeObservation {
         is_live: row.get(1),
         version: parse_cockroach_version(&build_tag).ok(),
     }
+}
+
+/// Fail closed: if health cannot be measured, it is not known to be safe.
+fn health_verdict(client: &mut Client) -> Result<(), String> {
+    cluster_health(client)
+        .map_err(|error| format!("could not measure cluster health: {error}"))
+        .and_then(|health| safe_to_restart(&health))
 }
 
 fn cluster_health(client: &mut Client) -> Result<ClusterHealth, AppError> {
