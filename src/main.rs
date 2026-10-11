@@ -1,8 +1,9 @@
 // file: src/main.rs
-// version: 3.4.0
+// version: 3.5.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-11
 
+mod events;
 mod health;
 mod layout;
 mod rollout;
@@ -25,12 +26,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::events::Source;
 use crate::health::{ClusterHealth, safe_to_restart};
 use crate::layout::{BinaryLayout, probe_writable};
 use crate::rollout::{
     FollowerAction, LeaderAction, NodeObservation, RolloutKind, RolloutStatus, all_nodes_on,
-    follower_action,
-    leader_action, live_version_span, stale_after,
+    follower_action, leader_action, live_version_span, stale_after,
 };
 
 const DEFAULT_BASE_URL: &str = "https://binaries.cockroachdb.com";
@@ -714,6 +715,7 @@ fn db_daemon_tick(
             )?;
             return follower_reconcile(cli, client, agent_id, false);
         }
+        events::prune(cli, client)?;
     }
 
     leader_reconcile(cli, client, auto_finalize, dry_run)?;
@@ -749,8 +751,10 @@ fn leader_reconcile(
         LeaderAction::MarkFinalized => {
             let rollout = open.expect("MarkFinalized implies an open rollout");
             set_rollout_status(cli, client, &rollout.id, RolloutStatus::Finalized, None)?;
-            audit(
+            events::note(
                 cli,
+                client,
+                Source::Agent,
                 "rollout_finalized",
                 &format!("target={}", rollout.manifest.target_version),
             )
@@ -784,12 +788,16 @@ fn propose_next_rollout(
 ) -> Result<(), AppError> {
     let (oldest, newest) = match live_version_span(nodes) {
         Ok(span) => span,
-        Err(reason) => return audit(cli, "proposal_skipped", &reason),
+        Err(reason) => {
+            return events::note(cli, client, Source::Agent, "proposal_skipped", &reason);
+        }
     };
     let Some(plan) = next_upgrade_plan(cli, Some(&oldest.to_string()), None)? else {
         if newest != oldest {
-            return audit(
+            return events::note(
                 cli,
+                client,
+                Source::Agent,
                 "proposal_skipped",
                 &format!("nodes run {oldest} and {newest}, but {oldest} needs no upgrade step"),
             );
@@ -799,8 +807,10 @@ fn propose_next_rollout(
     // A partially applied upgrade is resumed only when the nodes already
     // ahead run exactly this step's target; they then count as done.
     if newest != oldest && plan.next_version != newest {
-        return audit(
+        return events::note(
             cli,
+            client,
+            Source::Agent,
             "proposal_skipped",
             &format!(
                 "nodes run {oldest} and {newest}, but the next step from {oldest} is {}; finish or revert the partial upgrade by hand",
@@ -908,6 +918,7 @@ fn follower_reconcile(
             &rollout.id,
             Some(&reason),
         )?;
+        events::note(cli, client, Source::Agent, "gate_wait", &reason)?;
         return release_lease(cli, client, INSTALL_LEASE, agent_id);
     }
 
@@ -937,6 +948,16 @@ fn follower_reconcile(
                 &rollout.id,
                 None,
             )?;
+            events::note(
+                cli,
+                client,
+                Source::Agent,
+                "upgraded",
+                &format!(
+                    "{} -> {}",
+                    manifest.current_version, manifest.target_version
+                ),
+            )?;
             release_lease(cli, client, INSTALL_LEASE, agent_id)
         }
         Err(error) => {
@@ -957,6 +978,7 @@ fn follower_reconcile(
                 &rollout.id,
                 Some(&message),
             )?;
+            events::note(cli, client, Source::Agent, "upgrade_failed", &message)?;
             release_lease(cli, client, INSTALL_LEASE, agent_id)?;
             Err(error)
         }
@@ -1848,14 +1870,18 @@ fn publish_rollout(
         ],
     )?;
     if inserted != 1 {
-        return audit(
+        return events::note(
             cli,
+            client,
+            Source::Agent,
             "proposal_skipped",
             "another rollout opened while this proposal was being prepared",
         );
     }
-    audit(
+    events::note(
         cli,
+        client,
+        Source::Agent,
         "rollout_proposed",
         &format!(
             "current={} target={} warnings={}",
@@ -1949,8 +1975,10 @@ fn finalize_cluster(cli: &Cli, client: &mut Client, version: &Version) -> Result
     client.batch_execute(&format!(
         "SET CLUSTER SETTING version = '{cluster_version}'"
     ))?;
-    audit(
+    events::note(
         cli,
+        client,
+        Source::Agent,
         "finalize_complete",
         &format!("cluster_version={cluster_version}"),
     )
