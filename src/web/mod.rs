@@ -1,5 +1,5 @@
 // file: src/web/mod.rs
-// version: 1.5.0
+// version: 1.5.1
 // guid: 5a0df256-3b3d-47c1-8da7-af41189b6592
 // last-edited: 2026-10-11
 
@@ -142,7 +142,11 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    const PASSWORD: &str = "correct horse battery";
+    /// Generated per run so no credential literal lives in the source.
+    fn password() -> &'static str {
+        static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        PASSWORD.get_or_init(auth::random_token)
+    }
 
     struct FakeBackend {
         hash: String,
@@ -155,7 +159,7 @@ mod tests {
     impl FakeBackend {
         fn new(view_error: Option<&str>) -> Arc<Self> {
             Arc::new(Self {
-                hash: auth::hash_password(PASSWORD).unwrap(),
+                hash: auth::hash_password(password()).unwrap(),
                 view_error: view_error.map(str::to_string),
                 session_error: None,
                 sessions: Mutex::default(),
@@ -233,7 +237,7 @@ mod tests {
     async fn login(base: &str, client: &reqwest::Client) -> String {
         let response = client
             .post(format!("{base}/login"))
-            .form(&[("password", PASSWORD)])
+            .form(&[("password", password())])
             .send()
             .await
             .unwrap();
@@ -292,7 +296,7 @@ mod tests {
         }
         let response = client
             .post(format!("{base}/login"))
-            .form(&[("password", PASSWORD)])
+            .form(&[("password", password())])
             .send()
             .await
             .unwrap();
@@ -342,7 +346,7 @@ mod tests {
         let (base, client) = start(FakeBackend::new(None)).await;
         let response = client
             .post(format!("{base}/login"))
-            .form(&[("password", PASSWORD)])
+            .form(&[("password", password())])
             .send()
             .await
             .unwrap();

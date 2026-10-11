@@ -1,5 +1,5 @@
 // file: src/web/auth.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: 3b5291c0-75af-4721-8be7-20704b656704
 // last-edited: 2026-10-11
 
@@ -165,20 +165,16 @@ mod tests {
 
     #[test]
     fn passwords_hash_and_verify() {
-        assert!(hash_password("too short").is_err());
-        let hash = hash_password("correct horse battery").unwrap();
+        // Generated, so no credential literal lives in the source.
+        let password = random_token();
+        let other = random_token();
+        assert!(hash_password(&password[..MIN_PASSWORD_CHARS - 1]).is_err());
+        let hash = hash_password(&password).unwrap();
         assert!(hash.starts_with("$argon2id$"), "{hash}");
-        assert!(verify_password("correct horse battery", &hash));
-        assert!(!verify_password("correct horse batterY", &hash));
-        assert!(!verify_password(
-            "correct horse battery",
-            "not a phc string"
-        ));
-        assert_ne!(
-            hash,
-            hash_password("correct horse battery").unwrap(),
-            "salts differ"
-        );
+        assert!(verify_password(&password, &hash));
+        assert!(!verify_password(&other, &hash));
+        assert!(!verify_password(&password, "not a phc string"));
+        assert_ne!(hash, hash_password(&password).unwrap(), "salts differ");
     }
 
     #[test]
