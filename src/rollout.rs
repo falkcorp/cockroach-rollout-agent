@@ -1,5 +1,5 @@
 // file: src/rollout.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: ceae8795-4955-43fe-9829-2f28332e8005
 // last-edited: 2026-10-11
 
@@ -211,6 +211,102 @@ pub fn follower_action(installed: &Version, from: &Version, target: &Version) ->
     }
 }
 
+/// The oldest agent release that understands `RolloutKind::Restart`. Older
+/// agents ignore `kind`, so as leader they would end a restart at once and as
+/// followers they would report done without restarting anything.
+pub const MIN_RESTART_AGENT_VERSION: &str = "0.1.0";
+
+/// One `agent_status` row, reduced to what the restart decisions need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentObservation {
+    pub agent_id: String,
+    /// The CockroachDB node the agent runs beside; `None` for agents older
+    /// than `MIN_RESTART_AGENT_VERSION`, which never wrote it.
+    pub node_id: Option<i64>,
+    pub agent_version: Option<String>,
+    pub restarted_rollout_id: Option<String>,
+}
+
+/// What a node's agent should do about an active restart.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestartAction {
+    AlreadyRestarted,
+    /// Take the install lease, pass the health gate, then restart.
+    Restart,
+}
+
+pub fn restart_action(rollout_id: &str, restarted_rollout_id: Option<&str>) -> RestartAction {
+    if restarted_rollout_id == Some(rollout_id) {
+        RestartAction::AlreadyRestarted
+    } else {
+        RestartAction::Restart
+    }
+}
+
+/// True when every active node is live and its agent has recorded this
+/// restart. A node without a matching agent keeps the restart open, like a
+/// node without an agent keeps an upgrade open.
+pub fn restart_complete(
+    agents: &[AgentObservation],
+    nodes: &[NodeObservation],
+    rollout_id: &str,
+) -> bool {
+    !nodes.is_empty()
+        && nodes.iter().all(|node| {
+            node.is_live
+                && agents.iter().any(|agent| {
+                    agent.node_id == Some(node.node_id)
+                        && agent.restarted_rollout_id.as_deref() == Some(rollout_id)
+                })
+        })
+}
+
+/// Why the agents cannot run a rolling restart, one line per node; empty
+/// when every node has an agent at `minimum` or newer.
+pub fn restart_agent_gaps(
+    agents: &[AgentObservation],
+    nodes: &[NodeObservation],
+    minimum: &Version,
+) -> Vec<String> {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let Some(agent) = agents
+                .iter()
+                .find(|agent| agent.node_id == Some(node.node_id))
+            else {
+                return Some(format!(
+                    "node {} has no agent reporting its node id (agents older than {minimum} do not)",
+                    node.node_id
+                ));
+            };
+            match agent.agent_version.as_deref().map(Version::parse) {
+                Some(Ok(version)) if version >= *minimum => None,
+                Some(Ok(version)) => Some(format!(
+                    "{} runs agent {version}; it needs {minimum} or newer",
+                    agent.agent_id
+                )),
+                _ => Some(format!(
+                    "{} has not reported an agent version; upgrade it to {minimum} or newer",
+                    agent.agent_id
+                )),
+            }
+        })
+        .collect()
+}
+
+/// True once this node is back, live on `expected`, and gossip reports a
+/// start time newer than the one read before `systemctl restart`. The start
+/// time check rejects gossip that predates the restart.
+pub fn restarted_on(
+    expected: &Version,
+    started_before_us: i64,
+    node: &NodeObservation,
+    started_now_us: i64,
+) -> bool {
+    node.is_live && node.version.as_ref() == Some(expected) && started_now_us > started_before_us
+}
+
 /// How long an agent may go without a heartbeat before `status` calls it stale.
 ///
 /// Three ticks, so one slow tick or a node restart does not look like a dead agent.
@@ -232,6 +328,87 @@ mod tests {
             is_live: live,
             version: Version::parse(build).ok(),
         }
+    }
+
+    fn agent(node_id: i64, agent_version: Option<&str>, restarted: Option<&str>) -> AgentObservation {
+        AgentObservation {
+            agent_id: format!("host{node_id}:amd64"),
+            node_id: Some(node_id),
+            agent_version: agent_version.map(str::to_string),
+            restarted_rollout_id: restarted.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn restart_action_skips_nodes_already_restarted() {
+        assert_eq!(restart_action("r1", None), RestartAction::Restart);
+        assert_eq!(restart_action("r1", Some("r0")), RestartAction::Restart);
+        assert_eq!(restart_action("r1", Some("r1")), RestartAction::AlreadyRestarted);
+    }
+
+    #[test]
+    fn restart_completes_only_when_every_live_node_restarted() {
+        let nodes = [node(1, true, "25.4.17"), node(2, true, "25.4.17")];
+        let new = Some("0.1.0");
+        assert!(!restart_complete(&[], &[], "r1"), "no nodes is never complete");
+        assert!(!restart_complete(&[], &nodes, "r1"));
+        assert!(
+            !restart_complete(&[agent(1, new, Some("r1"))], &nodes, "r1"),
+            "node 2 has no agent"
+        );
+        assert!(!restart_complete(
+            &[agent(1, new, Some("r1")), agent(2, new, Some("r0"))],
+            &nodes,
+            "r1"
+        ));
+        assert!(restart_complete(
+            &[agent(1, new, Some("r1")), agent(2, new, Some("r1"))],
+            &nodes,
+            "r1"
+        ));
+        assert!(
+            !restart_complete(
+                &[agent(1, new, Some("r1")), agent(2, new, Some("r1"))],
+                &[node(1, true, "25.4.17"), node(2, false, "25.4.17")],
+                "r1"
+            ),
+            "a node that is down again is not done"
+        );
+    }
+
+    #[test]
+    fn restart_agent_gaps_names_missing_and_old_agents() {
+        let minimum = version("0.1.0");
+        let nodes = [
+            node(1, true, "25.4.17"),
+            node(2, true, "25.4.17"),
+            node(3, true, "25.4.17"),
+            node(4, true, "25.4.17"),
+        ];
+        let agents = [
+            agent(1, Some("0.1.0"), None),
+            agent(2, None, None),
+            agent(4, Some("0.0.3"), None),
+        ];
+        let gaps = restart_agent_gaps(&agents, &nodes, &minimum);
+        assert_eq!(gaps.len(), 3, "{gaps:?}");
+        assert!(gaps[0].contains("host2:amd64"), "{gaps:?}");
+        assert!(gaps[1].contains("node 3"), "{gaps:?}");
+        assert!(gaps[2].contains("host4:amd64") && gaps[2].contains("0.0.3"), "{gaps:?}");
+        assert!(restart_agent_gaps(&[agent(1, Some("1.0.0"), None)], &nodes[..1], &minimum).is_empty());
+    }
+
+    #[test]
+    fn restart_is_confirmed_only_by_a_newer_start() {
+        let expected = version("25.4.17");
+        let live = node(1, true, "25.4.17");
+        assert!(restarted_on(&expected, 100, &live, 200));
+        assert!(
+            !restarted_on(&expected, 100, &live, 100),
+            "an unchanged start time is gossip from before the restart"
+        );
+        assert!(!restarted_on(&expected, 100, &node(1, false, "25.4.17"), 200));
+        assert!(!restarted_on(&expected, 100, &node(1, true, "25.4.16"), 200));
     }
 
     #[test]
