@@ -1,7 +1,7 @@
 // file: src/main.rs
-// version: 3.3.0
+// version: 3.4.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
-// last-edited: 2026-10-10
+// last-edited: 2026-10-11
 
 mod health;
 mod layout;
@@ -28,7 +28,8 @@ use thiserror::Error;
 use crate::health::{ClusterHealth, safe_to_restart};
 use crate::layout::{BinaryLayout, probe_writable};
 use crate::rollout::{
-    FollowerAction, LeaderAction, NodeObservation, RolloutStatus, all_nodes_on, follower_action,
+    FollowerAction, LeaderAction, NodeObservation, RolloutKind, RolloutStatus, all_nodes_on,
+    follower_action,
     leader_action, live_version_span, stale_after,
 };
 
@@ -1461,6 +1462,42 @@ fn ensure_schema(cli: &Cli, client: &mut Client) -> Result<(), AppError> {
         format!(
             "ALTER TABLE {schema}.agent_status ADD COLUMN IF NOT EXISTS rollout_id STRING NULL"
         ),
+        format!(
+            "ALTER TABLE {schema}.rollouts ADD COLUMN IF NOT EXISTS kind STRING NOT NULL DEFAULT 'upgrade'"
+        ),
+        format!(
+            "ALTER TABLE {schema}.agent_status ADD COLUMN IF NOT EXISTS restarted_rollout_id STRING NULL"
+        ),
+        format!("ALTER TABLE {schema}.agent_status ADD COLUMN IF NOT EXISTS node_id INT8 NULL"),
+        format!(
+            "ALTER TABLE {schema}.agent_status ADD COLUMN IF NOT EXISTS agent_version STRING NULL"
+        ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.ui_auth (
+                id INT8 PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                password_hash STRING NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )"
+        ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.ui_sessions (
+                token_sha256 STRING PRIMARY KEY,
+                csrf_token STRING NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                client_ip STRING NOT NULL
+            )"
+        ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.events (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                agent_id STRING NOT NULL,
+                source STRING NOT NULL,
+                kind STRING NOT NULL,
+                detail STRING NOT NULL
+            )"
+        ),
     ];
     for statement in statements {
         client.batch_execute(&statement)?;
@@ -1643,13 +1680,17 @@ fn heartbeat_agent(
     client.execute(
         &format!(
             "
-            INSERT INTO {schema}.agent_status (agent_id, state, version, updated_at, last_seen)
-            VALUES ($1, 'idle', $2, now(), now())
+            INSERT INTO {schema}.agent_status
+                (agent_id, state, version, updated_at, last_seen, node_id, agent_version)
+            VALUES ($1, 'idle', $2, now(), now(), crdb_internal.node_id(), $3)
             ON CONFLICT (agent_id) DO UPDATE
-            SET version = excluded.version, last_seen = now()
+            SET version = excluded.version,
+                last_seen = now(),
+                node_id = excluded.node_id,
+                agent_version = excluded.agent_version
             "
         ),
-        &[&agent_id, &version.to_string()],
+        &[&agent_id, &version.to_string(), &env!("CARGO_PKG_VERSION")],
     )?;
     Ok(())
 }
@@ -1679,6 +1720,7 @@ fn record_agent_state(
 
 struct OpenRollout {
     id: String,
+    kind: RolloutKind,
     status: RolloutStatus,
     manifest: RolloutManifest,
 }
@@ -1696,7 +1738,7 @@ fn open_rollout(cli: &Cli, client: &mut Client) -> Result<Option<OpenRollout>, A
     let rows = client.query(
         &format!(
             "
-            SELECT id::STRING, status, manifest_json
+            SELECT id::STRING, kind, status, manifest_json
             FROM {schema}.rollouts
             WHERE status IN ('proposed', 'active', 'failed')
             ORDER BY created_at DESC
@@ -1708,10 +1750,12 @@ fn open_rollout(cli: &Cli, client: &mut Client) -> Result<Option<OpenRollout>, A
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    let status: String = row.get(1);
-    let manifest_json: String = row.get(2);
+    let kind: String = row.get(1);
+    let status: String = row.get(2);
+    let manifest_json: String = row.get(3);
     Ok(Some(OpenRollout {
         id: row.get(0),
+        kind: kind.parse().map_err(AppError::Message)?,
         status: status.parse().map_err(AppError::Message)?,
         manifest: serde_json::from_str(&manifest_json)?,
     }))
@@ -1785,12 +1829,15 @@ fn publish_rollout(
     let schema = sql_ident(&cli.schema)?;
     let agent_id = agent_node_id(cli)?;
     let manifest_json = serde_json::to_string(manifest)?;
-    client.execute(
+    let inserted = client.execute(
         &format!(
             "
             INSERT INTO {schema}.rollouts
-                (status, current_version, target_version, manifest_json, created_by)
-            VALUES ('proposed', $1, $2, $3, $4)
+                (kind, status, current_version, target_version, manifest_json, created_by)
+            SELECT 'upgrade', 'proposed', $1, $2, $3, $4
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {schema}.rollouts WHERE status IN ('proposed', 'active', 'failed')
+            )
             "
         ),
         &[
@@ -1800,6 +1847,13 @@ fn publish_rollout(
             &agent_id,
         ],
     )?;
+    if inserted != 1 {
+        return audit(
+            cli,
+            "proposal_skipped",
+            "another rollout opened while this proposal was being prepared",
+        );
+    }
     audit(
         cli,
         "rollout_proposed",

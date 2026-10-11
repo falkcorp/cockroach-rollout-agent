@@ -1,7 +1,7 @@
 // file: src/rollout.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: ceae8795-4955-43fe-9829-2f28332e8005
-// last-edited: 2026-10-10
+// last-edited: 2026-10-11
 
 //! Pure rollout decisions, kept free of SQL and I/O so they can be unit tested.
 
@@ -45,7 +45,7 @@ impl RolloutStatus {
 
 impl fmt::Display for RolloutStatus {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+        formatter.pad(self.as_str())
     }
 }
 
@@ -60,6 +60,42 @@ impl FromStr for RolloutStatus {
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
             other => Err(format!("unknown rollout status: {other}")),
+        }
+    }
+}
+
+/// What a rollout does to each node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloutKind {
+    /// Swap the binary to a new version, one node at a time.
+    Upgrade,
+    /// Restart every node in turn on the version it already runs.
+    Restart,
+}
+
+impl RolloutKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Upgrade => "upgrade",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+impl fmt::Display for RolloutKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.pad(self.as_str())
+    }
+}
+
+impl FromStr for RolloutKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "upgrade" => Ok(Self::Upgrade),
+            "restart" => Ok(Self::Restart),
+            other => Err(format!("unknown rollout kind: {other}")),
         }
     }
 }
@@ -210,6 +246,15 @@ mod tests {
             assert_eq!(status.as_str().parse::<RolloutStatus>(), Ok(status));
         }
         assert!("bogus".parse::<RolloutStatus>().is_err());
+    }
+
+    #[test]
+    fn kind_round_trips_through_text() {
+        for kind in [RolloutKind::Upgrade, RolloutKind::Restart] {
+            assert_eq!(kind.as_str().parse::<RolloutKind>(), Ok(kind));
+        }
+        assert!("rebuild".parse::<RolloutKind>().is_err());
+        assert_eq!(format!("{:<8}|", RolloutKind::Restart), "restart |");
     }
 
     #[test]
