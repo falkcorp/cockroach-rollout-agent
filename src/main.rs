@@ -904,6 +904,9 @@ fn install_ui_cert(
             info.hosts().describe()
         ));
     }
+    // Load it the way the listener will before touching disk, so a pair
+    // that validates but does not load never replaces the working files.
+    web::tls::server_config(material.pem.cert.as_bytes(), material.pem.key.as_bytes())?;
     write_ui_cert_files(&managed_ui_certs_dir(cli), &material.pem)
         .map_err(|error| format!("cannot write the certificate: {error}"))?;
     ui.install(&material.pem.cert, &material.pem.key, &material.fingerprint)
@@ -934,7 +937,10 @@ fn write_ui_cert_files(dir: &Path, pem: &uicert::Pem) -> io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     fs::create_dir_all(dir)?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    for (name, contents) in [("node.crt", &pem.cert), ("node.key", &pem.key)] {
+    // Key first: a crash between the renames then leaves the old cert with
+    // the new key, which fails to load and falls back, never the reverse
+    // half-state that looks installed.
+    for (name, contents) in [("node.key", &pem.key), ("node.crt", &pem.cert)] {
         let path = dir.join(name);
         if path.exists() {
             fs::copy(&path, dir.join(format!("{name}.prev")))?;
@@ -2698,26 +2704,37 @@ fn ui_listen_addr(value: &str) -> Result<Option<SocketAddr>, String> {
 
 /// The UI's certs dir and TLS config, the same resolution `self-check` reports.
 fn ui_tls(cli: &Cli) -> Result<(PathBuf, rustls::ServerConfig), String> {
-    let dir = match pick_ui_certs_dir(cli.ui_certs_dir.as_deref(), &managed_ui_certs_dir(cli)) {
-        Some(dir) => dir,
-        None => web::tls::resolve_certs_dir(
-            None,
-            service_name(cli).map_err(|error| error.to_string())?,
-        )?,
-    };
-    let config = web::tls::load_server_config(&dir)?;
-    Ok((dir, config))
+    choose_ui_tls(
+        cli.ui_certs_dir.as_deref(),
+        &managed_ui_certs_dir(cli),
+        || web::tls::resolve_certs_dir(None, service_name(cli).map_err(|error| error.to_string())?),
+    )
+    .map(|(dir, config, _)| (dir, config))
 }
 
-/// The override, else an approved certificate the agent installed, else
-/// `None`: fall back to the CockroachDB node certificate.
-fn pick_ui_certs_dir(override_dir: Option<&Path>, managed: &Path) -> Option<PathBuf> {
-    override_dir.map(Path::to_path_buf).or_else(|| {
-        managed
-            .join("node.crt")
-            .is_file()
-            .then(|| managed.to_path_buf())
-    })
+/// The override, else an installed UI certificate, else the CockroachDB
+/// node certificate from `fallback`. An installed pair that does not load
+/// is skipped rather than disabling the UI: the agent then sees it is not
+/// serving the approved certificate and installs it again. The flag says
+/// whether the installed pair was used.
+fn choose_ui_tls(
+    override_dir: Option<&Path>,
+    managed: &Path,
+    fallback: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<(PathBuf, rustls::ServerConfig, bool), String> {
+    if let Some(dir) = override_dir {
+        let config = web::tls::load_server_config(dir)?;
+        return Ok((dir.to_path_buf(), config, false));
+    }
+    if managed.join("node.crt").is_file() {
+        match web::tls::load_server_config(managed) {
+            Ok(config) => return Ok((managed.to_path_buf(), config, true)),
+            Err(reason) => eprintln!("ui: ignoring the installed certificate: {reason}"),
+        }
+    }
+    let dir = fallback()?;
+    let config = web::tls::load_server_config(&dir)?;
+    Ok((dir, config, false))
 }
 
 /// Starts the UI thread. Every failure leaves the UI off and the daemon
@@ -2736,12 +2753,20 @@ fn start_web_ui(cli: &Cli) -> Result<Option<Arc<web::UiServer>>, AppError> {
         }
         Err(reason) => return disabled(&reason),
     };
-    let (dir, tls) = match ui_tls(cli) {
+    let chosen = choose_ui_tls(
+        cli.ui_certs_dir.as_deref(),
+        &managed_ui_certs_dir(cli),
+        || web::tls::resolve_certs_dir(None, service_name(cli).map_err(|error| error.to_string())?),
+    );
+    let (dir, tls, is_managed) = match chosen {
         Ok(found) => found,
         Err(reason) => return disabled(&reason),
     };
-    let served = fs::read_to_string(dir.join("node.crt"))
-        .ok()
+    // Only an installed UI certificate counts as served; a node certificate
+    // reports none, so the dashboard says "node certificate".
+    let served = is_managed
+        .then(|| fs::read_to_string(dir.join("node.crt")).ok())
+        .flatten()
         .and_then(|pem| uicert::inspect(&pem).ok())
         .map(|info| info.fingerprint);
     let server = Arc::new(web::UiServer::new(tls, served));
@@ -2763,6 +2788,23 @@ fn start_web_ui(cli: &Cli) -> Result<Option<Arc<web::UiServer>>, AppError> {
 }
 
 fn ui_cert_command(cli: &Cli, action: &UiCertCommand) -> Result<(), AppError> {
+    // The daily timer runs renew on every node; only the CA node does work,
+    // and the rest stop here without touching the database.
+    let renew_ca = match action {
+        UiCertCommand::Renew { .. } => {
+            match read_ui_ca(&ui_ca_dir(cli)).map_err(AppError::Message)? {
+                Some(ca) => Some(ca),
+                None => {
+                    println!(
+                        "no UI CA key in {}; nothing to do on this node",
+                        ui_ca_dir(cli).display()
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        _ => None,
+    };
     let mut client = db_client(cli)?;
     ensure_schema(cli, &mut client)?;
     let client = &mut client;
@@ -2810,17 +2852,7 @@ fn ui_cert_command(cli: &Cli, action: &UiCertCommand) -> Result<(), AppError> {
             );
         }
         UiCertCommand::Renew { before_days, days } => {
-            let dir = ui_ca_dir(cli);
-            let (Ok(cert), Ok(key)) = (
-                fs::read_to_string(dir.join("ca.crt")),
-                fs::read_to_string(dir.join("ca.key")),
-            ) else {
-                println!(
-                    "no UI CA key in {}; nothing to do on this node",
-                    dir.display()
-                );
-                return Ok(());
-            };
+            let ca = renew_ca.expect("renew read the CA before connecting");
             let holder = agent_node_id(cli)?;
             let lease = acquire_lease(cli, client, UI_CERT_RENEW_LEASE, &holder, 300)?;
             if !lease.is_leader {
@@ -2844,7 +2876,6 @@ fn ui_cert_command(cli: &Cli, action: &UiCertCommand) -> Result<(), AppError> {
                     return Ok(());
                 }
             }
-            let ca = uicert::Pem { cert, key };
             let hosts = uicert::ca_hosts(&ca.cert).map_err(AppError::Message)?;
             let leaf = uicert::issue_leaf(&ca, &hosts, time::OffsetDateTime::now_utc(), *days)
                 .map_err(AppError::Message)?;
@@ -2906,6 +2937,22 @@ fn ui_cert_command(cli: &Cli, action: &UiCertCommand) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+/// This node's UI CA, `None` when it has none. Any other read failure is
+/// an error, so a key the agent cannot read never looks like "not the CA
+/// node" and lets the certificate expire unnoticed.
+fn read_ui_ca(dir: &Path) -> Result<Option<uicert::Pem>, String> {
+    let read = |name: &str| match fs::read_to_string(dir.join(name)) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot read {}: {error}", dir.join(name).display())),
+    };
+    match (read("ca.crt")?, read("ca.key")?) {
+        (Some(cert), Some(key)) => Ok(Some(uicert::Pem { cert, key })),
+        (None, None) => Ok(None),
+        _ => Err(format!("{} holds only half of the UI CA", dir.display())),
+    }
 }
 
 /// The CA an uploaded certificate must chain to: this node's, else the one
@@ -3473,24 +3520,61 @@ fn unix_time() -> Result<u64, AppError> {
 
 #[cfg(test)]
 mod tests {
+    fn write_pair(dir: &Path, pem: &uicert::Pem) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("node.crt"), &pem.cert).unwrap();
+        fs::write(dir.join("node.key"), &pem.key).unwrap();
+    }
+
+    fn test_pair(name: &str) -> uicert::Pem {
+        let cert = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
+        uicert::Pem {
+            cert: cert.cert.pem(),
+            key: cert.signing_key.serialize_pem(),
+        }
+    }
+
     #[test]
-    fn ui_tls_prefers_an_installed_certificate_over_the_node_certificate() {
-        let managed = tempfile::tempdir().unwrap();
+    fn a_broken_installed_pair_falls_back_instead_of_disabling_the_ui() {
+        let root = tempfile::tempdir().unwrap();
+        let managed = root.path().join("ui-certs");
+        let node = root.path().join("node-certs");
+        write_pair(&node, &test_pair("node.test"));
+        let fallback = || Ok(node.clone());
+
+        let (dir, _, is_managed) = choose_ui_tls(None, &managed, fallback).unwrap();
         assert_eq!(
-            pick_ui_certs_dir(None, managed.path()),
-            None,
-            "nothing installed: fall back to the CockroachDB unit's certs"
+            (dir, is_managed),
+            (node.clone(), false),
+            "nothing installed"
         );
-        fs::write(managed.path().join("node.crt"), "x").unwrap();
+
+        let good = test_pair("ui.test");
+        write_pair(&managed, &good);
+        let (dir, _, is_managed) = choose_ui_tls(None, &managed, fallback).unwrap();
+        assert_eq!((dir, is_managed), (managed.clone(), true));
+
+        // A crash between the two renames leaves a new cert with the old key.
+        fs::write(managed.join("node.key"), test_pair("other.test").key).unwrap();
+        let (dir, _, is_managed) = choose_ui_tls(None, &managed, fallback).unwrap();
         assert_eq!(
-            pick_ui_certs_dir(None, managed.path()),
-            Some(managed.path().to_path_buf())
+            (dir, is_managed),
+            (node.clone(), false),
+            "a mismatched pair must not take the UI down"
         );
-        assert_eq!(
-            pick_ui_certs_dir(Some(Path::new("/etc/ui")), managed.path()),
-            Some(PathBuf::from("/etc/ui")),
-            "an explicit override always wins"
-        );
+    }
+
+    #[test]
+    fn an_unreadable_ca_key_is_an_error_not_a_missing_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_ui_ca(dir.path()).unwrap().is_none(), "no CA here");
+        fs::write(dir.path().join("ca.crt"), "c").unwrap();
+        fs::write(dir.path().join("ca.key"), "k").unwrap();
+        assert!(read_ui_ca(dir.path()).unwrap().is_some());
+        fs::set_permissions(dir.path().join("ca.key"), fs::Permissions::from_mode(0o000)).unwrap();
+        let error = read_ui_ca(dir.path()).unwrap_err();
+        assert!(error.contains("ca.key"), "{error}");
     }
 
     #[test]
