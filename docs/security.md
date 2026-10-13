@@ -1,7 +1,7 @@
 <!-- file: docs/security.md -->
-<!-- version: 2.4.0 -->
+<!-- version: 2.5.0 -->
 <!-- guid: b1107208-a9c3-4018-9e86-a44cbf5c7f79 -->
-<!-- last-edited: 2026-10-12 -->
+<!-- last-edited: 2026-10-13 -->
 
 # Security Model
 
@@ -41,6 +41,22 @@ The rollout agent must be treated as privileged infrastructure automation.
   the one CockroachDB unit, for the `cockroach` user only. There is no sudo
   grant.
 - No upgrade starts without an operator running `approve`.
+- **Agent self-update** is approval-gated too, and pinned to bytes:
+  - The leader proposes only stable releases. It stores each architecture's
+    SHA-256 from the release's `SHA256SUMS`, and the operator approves those
+    digests.
+  - Agents verify the download against the stored digest, not a freshly
+    fetched `SHA256SUMS`. A release asset replaced after approval is refused.
+  - The trust root is GitHub over TLS at proposal time, plus the operator's
+    review. The release's build-provenance attestations can be checked by
+    hand with `gh attestation verify` before approving.
+  - The new binary runs as `cockroach`, the user that could already replace
+    it, so self-update grants no new privilege.
+  - The rollback step (`agent-preflight`) always runs the root-owned
+    `/usr/local/bin` copy, so a broken update cannot disable its own
+    rollback.
+  - No polkit grant covers the agent's own unit. It restarts by exiting with
+    status 75.
 - The SQL identity is a dedicated `rollout` user with `CREATE` on the
   coordination database and the `VIEWCLUSTERMETADATA` and
   `MODIFYCLUSTERSETTING` system privileges. The node certificate is not

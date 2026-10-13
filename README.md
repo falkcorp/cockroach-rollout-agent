@@ -1,7 +1,7 @@
 <!-- file: README.md -->
-<!-- version: 4.3.0 -->
+<!-- version: 4.4.0 -->
 <!-- guid: c68a62ce-72d1-45cc-a6c8-d3dfc41d0e34 -->
-<!-- last-edited: 2026-10-12 -->
+<!-- last-edited: 2026-10-13 -->
 
 # cockroach-rollout-agent
 
@@ -60,6 +60,9 @@ cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" undecline v26.1.8
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" ui-cert init-ca
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" ui-cert renew
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" ui-cert show
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" agent-update show
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" agent-update approve 0.3.1
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" agent-update retry
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" restart-cluster
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" set-ui-password
 ```
@@ -255,6 +258,10 @@ The daemon runs as the `cockroach` user with `NoNewPrivileges=true` and
   so root never executes a binary the `cockroach` user can write;
 - a polkit rule (`examples/50-cockroach-rollout-agent.rules`) allows only
   start, stop, and restart of the one CockroachDB unit, for `cockroach` only;
+- the agent runs from its own layout,
+  `/var/lib/cockroach-rollout-agent/agent/bin/cockroach-rollout-agent`, and
+  updates itself there once an operator approves a release. It restarts by
+  exiting with status 75 for systemd to start it again;
 - the audit log and state directories are the only writable paths.
 
 `scripts/install-rollout-agent.sh` sets all of this up per host. See

@@ -1,7 +1,7 @@
 // file: src/layout.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 38e9eb5d-1113-4a32-b8ef-45ade70b5c39
-// last-edited: 2026-10-10
+// last-edited: 2026-10-13
 
 //! Agent-owned CockroachDB binary layout.
 //!
@@ -22,6 +22,13 @@
 //! partially written file. A running process keeps its executable inode, so
 //! the swap happens while the node is still up and only `systemctl restart`
 //! causes downtime.
+//!
+//! The agent's own binary uses the same layout one level down, so it can
+//! update itself without root:
+//!
+//! ```text
+//! <root>/agent/bin/cockroach-rollout-agent -> ../versions/cockroach-rollout-agent-v0.3.0
+//! ```
 
 use std::fs;
 use std::io;
@@ -32,17 +39,40 @@ use semver::Version;
 
 const BIN_DIR: &str = "bin";
 const VERSIONS_DIR: &str = "versions";
-const LINK_NAME: &str = "cockroach";
+const AGENT_DIR: &str = "agent";
+pub const AGENT_BINARY_NAME: &str = "cockroach-rollout-agent";
 
-/// Paths of the agent-owned binary layout rooted at `root`.
+/// Paths of an agent-owned binary layout rooted at `root`.
 #[derive(Debug, Clone)]
 pub struct BinaryLayout {
     root: PathBuf,
+    /// File name of the symlink under `bin/`.
+    link_name: &'static str,
+    /// Staged versions are named `<prefix><version>`.
+    prefix: &'static str,
 }
 
 impl BinaryLayout {
+    /// The CockroachDB layout: `<root>/bin/cockroach`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            link_name: "cockroach",
+            prefix: "cockroach-v",
+        }
+    }
+
+    /// The agent's own layout: `<agent_root>/agent/bin/cockroach-rollout-agent`.
+    pub fn agent(agent_root: &Path) -> Self {
+        Self {
+            root: agent_root.join(AGENT_DIR),
+            link_name: AGENT_BINARY_NAME,
+            prefix: "cockroach-rollout-agent-v",
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn bin_dir(&self) -> PathBuf {
@@ -55,23 +85,23 @@ impl BinaryLayout {
 
     /// The symlink the agent swaps. The system binary path points here.
     pub fn current_link(&self) -> PathBuf {
-        self.bin_dir().join(LINK_NAME)
+        self.bin_dir().join(self.link_name)
     }
 
-    pub fn version_file_name(version: &Version) -> String {
-        format!("cockroach-v{version}")
+    pub fn version_file_name(&self, version: &Version) -> String {
+        format!("{}{version}", self.prefix)
     }
 
     pub fn version_path(&self, version: &Version) -> PathBuf {
-        self.versions_dir().join(Self::version_file_name(version))
+        self.versions_dir().join(self.version_file_name(version))
     }
 
-    /// Relative link target stored in `bin/cockroach`, so the layout still
-    /// resolves if `root` is bind-mounted or moved.
-    fn link_target(version: &Version) -> PathBuf {
+    /// Relative link target stored in `bin/`, so the layout still resolves
+    /// if `root` is bind-mounted or moved.
+    fn link_target(&self, version: &Version) -> PathBuf {
         Path::new("..")
             .join(VERSIONS_DIR)
-            .join(Self::version_file_name(version))
+            .join(self.version_file_name(version))
     }
 
     /// Returns the file name `bin/cockroach` currently points at, for example
@@ -99,7 +129,7 @@ impl BinaryLayout {
     pub fn verify_wired(&self, exec_path: &Path) -> Result<(), String> {
         if exec_path != self.current_link() {
             return Err(format!(
-                "the CockroachDB unit runs {}, expected {}; run install-rollout-agent.sh to add the ExecStart drop-in",
+                "the unit runs {}, expected {}; run install-rollout-agent.sh to wire it up",
                 exec_path.display(),
                 self.current_link().display()
             ));
@@ -130,7 +160,7 @@ impl BinaryLayout {
         let destination = self.version_path(version);
         let partial = self
             .versions_dir()
-            .join(format!(".{}.partial", Self::version_file_name(version)));
+            .join(format!(".{}.partial", self.version_file_name(version)));
         fs::copy(source, &partial)?;
         fs::set_permissions(&partial, fs::Permissions::from_mode(0o755))?;
         fs::File::open(&partial)?.sync_all()?;
@@ -150,7 +180,7 @@ impl BinaryLayout {
                 format!("{} has not been staged", staged.display()),
             ));
         }
-        self.point_at(&Self::link_target(version))
+        self.point_at(&self.link_target(version))
     }
 
     /// Points `bin/cockroach` back at a previously active file name.
@@ -172,7 +202,7 @@ impl BinaryLayout {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        let temporary = self.bin_dir().join(format!(".{LINK_NAME}.next"));
+        let temporary = self.bin_dir().join(format!(".{}.next", self.link_name));
         match fs::remove_file(&temporary) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -194,7 +224,7 @@ impl BinaryLayout {
             if name == active || Some(name.as_str()) == keep {
                 continue;
             }
-            if !name.starts_with("cockroach-v") && !name.ends_with(".partial") {
+            if !name.starts_with(self.prefix) && !name.ends_with(".partial") {
                 continue;
             }
             fs::remove_file(entry.path())?;

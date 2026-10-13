@@ -1,7 +1,7 @@
 // file: src/cluster_view.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: b65f6d37-171d-4be5-8fbc-306d362e20c2
-// last-edited: 2026-10-12
+// last-edited: 2026-10-13
 
 //! One read-only snapshot of everything an operator looks at. `status` prints
 //! it and the web dashboard renders it.
@@ -11,6 +11,7 @@ use std::time::Duration;
 use postgres::Client;
 use semver::Version;
 
+use crate::agentupdate::{self, AgentReleaseRow};
 use crate::health::ClusterHealth;
 use crate::releases::{self, ReleasesView};
 use crate::rollout::{
@@ -39,6 +40,8 @@ pub struct ClusterView {
     pub releases: Option<ReleasesView>,
     /// The approved and staged UI certificates, newest first.
     pub ui_certs: Vec<UiCertRow>,
+    /// Agent releases, newest first.
+    pub agent_releases: Vec<AgentReleaseRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +119,11 @@ pub struct AgentRow {
     pub ui_cert_fingerprint: Option<String>,
     /// Why this agent could not install the approved UI certificate.
     pub ui_cert_error: Option<String>,
+    /// The agent release this agent has claimed and is updating to.
+    pub agent_update_to: Option<String>,
+    /// Why that update failed, or, with no claim, why this agent cannot
+    /// update itself.
+    pub agent_update_error: Option<String>,
 }
 
 impl AgentRow {
@@ -254,6 +262,7 @@ pub fn load(cli: &Cli, client: &mut Client) -> Result<ClusterView, AppError> {
             .as_secs(),
         releases,
         ui_certs: uicert::rows(cli, client)?,
+        agent_releases: agentupdate::rows(cli, client)?,
     })
 }
 
@@ -266,7 +275,7 @@ pub fn agent_rows(cli: &Cli, client: &mut Client) -> Result<Vec<AgentRow>, AppEr
                 SELECT agent_id, state, version, error,
                        extract(epoch FROM now() - coalesce(last_seen, updated_at))::INT8,
                        node_id, agent_version, restarted_rollout_id, rollout_id,
-                       ui_cert_fingerprint, ui_cert_error
+                       ui_cert_fingerprint, ui_cert_error, agent_update_to, agent_update_error
                 FROM {schema}.agent_status
                 ORDER BY agent_id
                 "
@@ -288,6 +297,8 @@ pub fn agent_rows(cli: &Cli, client: &mut Client) -> Result<Vec<AgentRow>, AppEr
             age_secs: row.get(4),
             ui_cert_fingerprint: row.get(9),
             ui_cert_error: row.get(10),
+            agent_update_to: row.get(11),
+            agent_update_error: row.get(12),
         })
         .collect())
 }
@@ -348,6 +359,8 @@ impl ClusterView {
                     age_secs: 10,
                     ui_cert_fingerprint: None,
                     ui_cert_error: None,
+                    agent_update_to: None,
+                    agent_update_error: None,
                 })
                 .collect(),
             leases: vec![
@@ -372,6 +385,7 @@ impl ClusterView {
             stale_after_secs: 900,
             releases: None,
             ui_certs: Vec::new(),
+            agent_releases: Vec::new(),
         }
     }
 }

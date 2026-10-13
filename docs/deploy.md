@@ -1,7 +1,7 @@
 <!-- file: docs/deploy.md -->
-<!-- version: 2.4.0 -->
+<!-- version: 2.5.0 -->
 <!-- guid: 41eb3d6e-f70e-431d-8f3e-33d1ca5e45c1 -->
-<!-- last-edited: 2026-10-12 -->
+<!-- last-edited: 2026-10-13 -->
 
 # Deployment
 
@@ -26,6 +26,8 @@ The agent runs as `cockroach` and never needs root at runtime:
 /var/lib/cockroach-rollout-agent/bin/cockroach  -> ../versions/cockroach-v25.3.0   (agent swaps this)
 /var/lib/cockroach-rollout-agent/versions/cockroach-v25.3.0                         (real binary)
 /usr/local/bin/cockroach                                                            (root-owned copy, CLI only)
+/var/lib/cockroach-rollout-agent/agent/bin/cockroach-rollout-agent -> ../versions/cockroach-rollout-agent-v0.3.0   (agent swaps this)
+/usr/local/bin/cockroach-rollout-agent                              (root-owned copy: operators and agent-preflight)
 ```
 
 - **Root never runs agent-writable code:** the `cockroach` user can replace
@@ -40,6 +42,12 @@ The agent runs as `cockroach` and never needs root at runtime:
   running. Only the restart causes downtime. If the node does not rejoin on the
   new build within `CROACH_ROLLOUT_RESTART_TIMEOUT_SECONDS`, the link is
   pointed back at the previous version and the unit is restarted again.
+- **Agent self-update:** the agent units run the agent from its own layout,
+  `agent/bin/cockroach-rollout-agent`, which the agent swaps the same way
+  once an operator approves a new agent release (see
+  [Agent updates](#7-agent-updates)). To restart itself it exits with status
+  75, and the unit's `RestartForceExitStatus=75` starts it again, so it needs
+  no polkit grant for its own unit.
 - **Service control:** `examples/50-cockroach-rollout-agent.rules` is a polkit
   rule allowing only `start`, `stop` and `restart` of the one CockroachDB unit,
   and only for the `cockroach` user. sudo does not work here, because the agent
@@ -273,6 +281,55 @@ approval.
 - **Disabling the UI:** set `CROACH_ROLLOUT_UI_LISTEN=off`. If the
   certificate cannot be loaded, the agent logs `ui disabled: <reason>` and
   keeps running. It never serves plain HTTP.
+
+## 7. Agent Updates
+
+The leader checks this repository's latest **stable** GitHub release with
+the CockroachDB release list: hourly, or on **Check now**. It ignores drafts and
+pre-releases. A release newer than the leader's own agent is proposed with
+each architecture's SHA-256 taken from the release's `SHA256SUMS`.
+
+1. **Review.** The **Agent updates** panel, or `agent-update show`, lists the
+   proposal with its release page and both digests.
+2. **Approve.** Use the panel, or:
+
+   ```bash
+   sudo -u cockroach bash -c 'set -a; . /etc/cockroach-rollout-agent.env; cockroach-rollout-agent agent-update approve 0.3.1'
+   ```
+
+   `agent-update decline <version>` refuses a proposal. Used on an approved
+   release, it stops agents that have not updated yet.
+3. **Rollout.** Agents update one at a time, each at the end of its own
+   tick, so never in the middle of a CockroachDB upgrade or restart. Each one:
+   - claims the update, which no other agent may do until it has finished;
+   - downloads its architecture's tarball and refuses it unless the SHA-256
+     matches the approved digest;
+   - runs the new binary's `--version`, which must report the approved
+     version, and `self-check`;
+   - swaps `agent/bin/cockroach-rollout-agent` and exits with status 75, and
+     systemd starts the new binary;
+   - after its first good tick, the new binary clears the claim, and the
+     next agent goes.
+4. **Rollback.** Before every start, the unit runs
+   `/usr/local/bin/cockroach-rollout-agent agent-preflight` (the root-owned
+   copy, not the new binary).
+   - A new binary has 10 minutes to finish a tick, or it exits.
+   - If it has not settled after two starts, preflight points the link back
+     at the previous binary.
+   - The restored agent records the failure. Its claim then holds every
+     other agent back until you run `agent-update retry`, or approve or
+     decline something else.
+
+Converting a host to the agent layout takes one more run of
+`install-rollout-agent.sh` (v0.3.0 or later), as root. After that, updates
+need neither ssh nor sudo. A host that still runs
+`/usr/local/bin/cockroach-rollout-agent` from its unit shows why in the
+panel and is skipped. It does not block the others.
+
+`/usr/local/bin/cockroach-rollout-agent` is not updated and lags the agents.
+For operator commands, prefer the agent's own copy, still as `cockroach`:
+`/var/lib/cockroach-rollout-agent/agent/bin/cockroach-rollout-agent`. Never
+run anything under the agent root as root.
 
 ## Docker
 

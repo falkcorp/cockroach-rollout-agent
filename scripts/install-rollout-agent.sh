@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # file: scripts/install-rollout-agent.sh
-# version: 2.1.0
+# version: 2.2.0
 # guid: 963803cf-366e-40c7-bc9a-67bcd54597a9
-# last-edited: 2026-10-12
+# last-edited: 2026-10-13
 #
 # Installs or updates cockroach-rollout-agent on one CockroachDB host. Stages
 # the running CockroachDB version under the agent root and adds a systemd
@@ -10,6 +10,11 @@
 # restart on. /usr/local/bin/cockroach stays a root-owned file the agent never
 # touches. Idempotent: safe to rerun. Never starts, stops, or restarts
 # CockroachDB, and leaves the agent disabled unless --enable is given.
+#
+# The agent units run the agent from ${AGENT_ROOT}/agent/bin, a link the
+# agent swaps when it updates itself; this script points it at the binary it
+# installs. /usr/local/bin/cockroach-rollout-agent stays root-owned for
+# operators and for agent-preflight.
 #
 # Root never executes or follows links under the agent root: the cockroach
 # user can rewrite anything there. Every command that touches it runs as
@@ -38,6 +43,8 @@ SYSTEM_BINARY=/usr/local/bin/cockroach
 AGENT_LINK=${AGENT_ROOT}/bin/cockroach
 DROPIN_NAME=50-cockroach-rollout-agent.conf
 AGENT_BINARY=/usr/local/bin/cockroach-rollout-agent
+AGENT_SELF_DIR=${AGENT_ROOT}/agent
+AGENT_SELF_LINK=${AGENT_SELF_DIR}/bin/cockroach-rollout-agent
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 EXAMPLES_DIR="${SCRIPT_DIR}/../examples"
@@ -134,6 +141,29 @@ stage_current_binary() {
         as_agent mv -Tf "${AGENT_ROOT}/bin/.cockroach.next" "$AGENT_LINK"
         log "$AGENT_LINK -> ../versions/${name}"
     fi
+}
+
+# Copies the installed agent into the agent's own layout and points the link
+# the units run at it. Unlike bin/cockroach, an existing link is replaced:
+# running this script means "run this agent binary". A pending self-update is
+# dropped so agent-preflight cannot roll back to something older.
+stage_agent_binary() {
+    local version name staged
+    version=$("$AGENT_BINARY" --version | awk '{print $NF}')
+    [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+        die "unexpected version from $AGENT_BINARY: $version"
+    name="cockroach-rollout-agent-v${version}"
+    staged="${AGENT_SELF_DIR}/versions/${name}"
+
+    as_agent mkdir -p -m 0750 "${AGENT_SELF_DIR}/bin" "${AGENT_SELF_DIR}/versions"
+    as_agent install -m 0755 "$AGENT_BINARY" "${AGENT_SELF_DIR}/versions/.${name}.partial"
+    as_agent mv -f "${AGENT_SELF_DIR}/versions/.${name}.partial" "$staged"
+    [[ $(as_agent "$staged" --version | awk '{print $NF}') == "$version" ]] ||
+        die "staged copy $staged does not report $version"
+    as_agent rm -f "${AGENT_SELF_DIR}/pending.json" "${AGENT_SELF_DIR}/rolled-back"
+    as_agent ln -sfn "../versions/${name}" "${AGENT_SELF_DIR}/bin/.cockroach-rollout-agent.next"
+    as_agent mv -Tf "${AGENT_SELF_DIR}/bin/.cockroach-rollout-agent.next" "$AGENT_SELF_LINK"
+    log "$AGENT_SELF_LINK -> ../versions/${name}"
 }
 
 # Prints the unit's one effective ExecStart= value, backslash continuations
@@ -272,6 +302,7 @@ chmod 0640 "$key_tmp"
 mv -f "$key_tmp" "$CERTS_DIR/client.rollout.pk8"
 
 stage_current_binary
+stage_agent_binary
 
 log "writing env, unit, and polkit rule"
 render "$EXAMPLES_DIR/cockroach-rollout-agent.env.example" "$ENV_FILE" 0640 "root:$AGENT_USER"

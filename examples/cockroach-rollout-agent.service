@@ -1,5 +1,5 @@
 # file: examples/cockroach-rollout-agent.service
-# version: 3.1.0
+# version: 3.2.0
 # guid: eaf842e1-7611-4539-848e-73b84ed31c7e
 
 # Replace @CROACH_ROLLOUT_SERVICE@ with this host's CockroachDB unit name.
@@ -16,9 +16,17 @@ Type=simple
 User=cockroach
 Group=cockroach
 EnvironmentFile=/etc/cockroach-rollout-agent.env
-ExecStart=/usr/local/bin/cockroach-rollout-agent daemon
+# The agent runs from its own layout so it can update itself. Before every
+# start, the root-owned copy counts starts of a freshly updated binary and
+# restores the previous one if it never settles. `-`: a preflight that
+# cannot run must never keep the agent from starting.
+ExecStartPre=-/usr/local/bin/cockroach-rollout-agent agent-preflight
+ExecStart=/var/lib/cockroach-rollout-agent/agent/bin/cockroach-rollout-agent daemon
 Restart=on-failure
 RestartSec=10s
+# 75: the agent swapped in a new binary and asks to be started on it.
+SuccessExitStatus=75
+RestartForceExitStatus=75
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

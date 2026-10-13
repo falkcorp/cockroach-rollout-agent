@@ -1,7 +1,7 @@
 // file: src/web/db.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 143f3009-b250-465e-80ae-1e93b2544162
-// last-edited: 2026-10-12
+// last-edited: 2026-10-13
 
 //! `Backend` over the coordination database. Every method opens its own
 //! connection; the caller runs it inside `spawn_blocking`, so the blocking
@@ -140,6 +140,10 @@ impl Backend for DbBackend {
                 fingerprint,
                 approve,
             } => ops::decide_ui_cert(cli, &mut client, actor, &fingerprint, approve),
+            WebAction::AgentUpdateDecide { version, approve } => {
+                ops::decide_agent_release(cli, &mut client, actor, &version, approve)
+            }
+            WebAction::AgentUpdateRetry => ops::retry_agent_update(cli, &mut client, actor),
             WebAction::UiCertUpload { cert_pem, key_pem } => ops::upload_ui_cert(
                 cli,
                 &mut client,

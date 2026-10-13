@@ -1,5 +1,5 @@
 # file: examples/cockroach-rollout-agent-ui-cert.service
-# version: 1.0.0
+# version: 1.1.0
 # guid: 91439bba-1f26-45db-b30b-feee4da97866
 
 # Run daily by cockroach-rollout-agent-ui-cert.timer. Stages a new web UI
@@ -17,7 +17,7 @@ Type=oneshot
 User=cockroach
 Group=cockroach
 EnvironmentFile=/etc/cockroach-rollout-agent.env
-ExecStart=/usr/local/bin/cockroach-rollout-agent ui-cert renew
+ExecStart=/var/lib/cockroach-rollout-agent/agent/bin/cockroach-rollout-agent ui-cert renew
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

@@ -1,13 +1,14 @@
 // file: src/web/render.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 7e2b2274-de88-426c-bdd9-4faeced6f062
-// last-edited: 2026-10-12
+// last-edited: 2026-10-13
 
 //! HTML for the web UI. Every dynamic value passes through `escape`, and the
 //! public functions take typed values, never pre-built HTML.
 
 use std::fmt::Write as _;
 
+use crate::agentupdate::AgentReleaseRow;
 use crate::cluster_view::{AgentRow, ClusterView, EventRow, LeaseRow, RolloutRow};
 use crate::health::safe_to_restart;
 use crate::ops::AvailableAction;
@@ -103,6 +104,11 @@ pub fn dashboard(
     }
     main.push_str(&nodes_section(&view.nodes));
     main.push_str(&agents_section(&view.agents, view.stale_after_secs));
+    main.push_str(&agent_update_section(
+        &view.agent_releases,
+        &view.agents,
+        csrf,
+    ));
     main.push_str(&ui_cert_section(&view.ui_certs, &view.agents, csrf));
     main.push_str(&locks_section(&view.leases));
     main.push_str(&health_section(view));
@@ -402,6 +408,101 @@ fn ui_cert_section(certs: &[UiCertRow], agents: &[AgentRow], csrf: &str) -> Stri
          <button type=\"submit\">Stage</button></form></details></section>",
         csrf_field(csrf)
     );
+    html
+}
+
+fn agent_update_section(releases: &[AgentReleaseRow], agents: &[AgentRow], csrf: &str) -> String {
+    let mut html = String::from("<section><h2>Agent updates</h2>");
+    let open: Vec<&AgentReleaseRow> = releases
+        .iter()
+        .filter(|row| matches!(row.status.as_str(), "proposed" | "approved"))
+        .collect();
+    if open.is_empty() {
+        html.push_str("<p>No agent release is waiting for approval or rolling out.</p>");
+    }
+    for row in open {
+        let version = escape(&row.version.to_string());
+        let field = format!(
+            "{}<input type=\"hidden\" name=\"version\" value=\"{version}\">",
+            csrf_field(csrf)
+        );
+        let _ = write!(
+            html,
+            "<h3>v{version}: {}</h3><p>{}</p><div class=\"scroll\"><table><thead><tr>\
+             <th>Architecture</th><th>SHA-256</th></tr></thead><tbody>",
+            escape(&row.status),
+            link(&row.html_url, "release page")
+        );
+        for (arch, asset) in &row.assets {
+            let _ = write!(
+                html,
+                "<tr><td>{}</td><td><code>{}</code></td></tr>",
+                escape(arch),
+                escape(&asset.sha256)
+            );
+        }
+        html.push_str("</tbody></table></div>");
+        if row.status == "proposed" {
+            let _ = write!(
+                html,
+                "<form method=\"post\" action=\"/actions/agent-update-approve\" class=\"action\">\
+                 {field}<p>Agents download exactly these builds, refuse anything else, and \
+                 update one at a time. A build that does not settle is rolled back.</p>\
+                 <button type=\"submit\">Approve agent v{version}</button></form>\
+                 <form method=\"post\" action=\"/actions/agent-update-decline\">{field}\
+                 <button type=\"submit\">Decline</button></form>"
+            );
+        } else {
+            let _ = write!(
+                html,
+                "<form method=\"post\" action=\"/actions/agent-update-decline\">{field}\
+                 <button type=\"submit\">Stop this update</button></form>"
+            );
+        }
+    }
+    let rows: Vec<[String; 3]> = agents
+        .iter()
+        .map(|agent| {
+            [
+                agent.observation.agent_id.clone(),
+                agent
+                    .observation
+                    .agent_version
+                    .clone()
+                    .unwrap_or_else(|| "—".to_string()),
+                crate::agentupdate::progress(
+                    agent.agent_update_to.as_deref(),
+                    agent.agent_update_error.as_deref(),
+                ),
+            ]
+        })
+        .collect();
+    if !rows.is_empty() {
+        html.push_str(
+            "<div class=\"scroll\"><table><thead><tr><th>Agent</th><th>Version</th>\
+             <th>Update</th></tr></thead><tbody>",
+        );
+        for row in rows {
+            html.push_str("<tr>");
+            for cell in row {
+                let _ = write!(html, "<td>{}</td>", escape(&cell));
+            }
+            html.push_str("</tr>");
+        }
+        html.push_str("</tbody></table></div>");
+    }
+    if agents
+        .iter()
+        .any(|agent| agent.agent_update_to.is_some() && agent.agent_update_error.is_some())
+    {
+        let _ = write!(
+            html,
+            "<form method=\"post\" action=\"/actions/agent-update-retry\">{}\
+             <button type=\"submit\">Retry failed agent updates</button></form>",
+            csrf_field(csrf)
+        );
+    }
+    html.push_str("</section>");
     html
 }
 
@@ -803,6 +904,62 @@ mod tests {
         );
         assert!(html.contains("not &lt;among&gt; the names"));
         assert!(html.contains("action=\"/actions/ui-cert-upload\""));
+        let forms = html.matches("<form").count();
+        assert_eq!(html.matches("name=\"csrf\" value=\"tok\"").count(), forms);
+    }
+
+    #[test]
+    fn agent_update_panel_shows_digests_progress_and_bound_decisions() {
+        use crate::agentupdate::{AgentReleaseRow, Asset};
+        let digest = "cd".repeat(32);
+        let mut view = ClusterView::sample();
+        view.agents[0].agent_update_to = Some("0.3.1".to_string());
+        view.agents[1].agent_update_error = Some("runs /usr/<local>/bin".to_string());
+        view.agents[2].agent_update_to = Some("0.3.1".to_string());
+        view.agents[2].agent_update_error = Some("self-check failed".to_string());
+        view.agent_releases = vec![
+            AgentReleaseRow {
+                version: Version::new(0, 3, 1),
+                status: "proposed".to_string(),
+                html_url: "https://github.com/o/r/releases/tag/v0.3.1".to_string(),
+                assets: [("amd64", "https://dl/a"), ("arm64", "https://dl/b")]
+                    .into_iter()
+                    .map(|(arch, url)| {
+                        (
+                            arch.to_string(),
+                            Asset {
+                                url: url.to_string(),
+                                sha256: digest.clone(),
+                            },
+                        )
+                    })
+                    .collect(),
+                proposed_at: "2026-10-13".to_string(),
+                decided_by: None,
+            },
+            AgentReleaseRow {
+                version: Version::new(0, 3, 0),
+                status: "declined".to_string(),
+                html_url: String::new(),
+                assets: Default::default(),
+                proposed_at: "2026-10-12".to_string(),
+                decided_by: Some("cli".to_string()),
+            },
+        ];
+        let html = dashboard(&view, &[], "tok", None);
+        assert!(html.contains("<h2>Agent updates</h2>"));
+        assert_eq!(html.matches(&digest).count(), 2, "full digest per arch");
+        assert!(html.contains("action=\"/actions/agent-update-approve\""));
+        assert!(html.contains("action=\"/actions/agent-update-decline\""));
+        assert_eq!(html.matches("name=\"version\" value=\"0.3.1\"").count(), 2);
+        assert!(
+            !html.contains("value=\"0.3.0\""),
+            "settled releases offer nothing"
+        );
+        assert!(html.contains("updating to 0.3.1"));
+        assert!(html.contains("runs /usr/&lt;local&gt;/bin"));
+        assert!(html.contains("update to 0.3.1 failed: self-check failed"));
+        assert!(html.contains("action=\"/actions/agent-update-retry\""));
         let forms = html.matches("<form").count();
         assert_eq!(html.matches("name=\"csrf\" value=\"tok\"").count(), forms);
     }
