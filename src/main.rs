@@ -10,6 +10,7 @@ mod layout;
 mod ops;
 mod releases;
 mod rollout;
+mod settings;
 mod web;
 
 use std::ffi::OsStr;
@@ -41,6 +42,7 @@ use crate::rollout::{
     all_nodes_on, follower_action, leader_action, live_version_span, proposal_declined,
     restart_action, restart_complete, restarted_on, should_note,
 };
+use crate::settings::SettingsReport;
 
 const DEFAULT_BASE_URL: &str = "https://binaries.cockroachdb.com";
 const DEFAULT_GITHUB_API_URL: &str =
@@ -353,6 +355,10 @@ struct RolloutManifest {
     release_note_warnings: Vec<String>,
     release_note_warnings_approved: bool,
     artifacts: Vec<Artifact>,
+    /// Overridden settings the target changes; `None` for manifests made
+    /// before v0.2.0, by `prepare`, and for restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settings_report: Option<settings::SettingsReport>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -520,6 +526,7 @@ fn prepare_command(
         release_note_warnings: plan.release_note_warnings,
         release_note_warnings_approved: allow_breaking_warnings,
         artifacts,
+        settings_report: None,
     };
 
     let manifest_path = cli.artifacts_dir.join("manifest.json");
@@ -979,8 +986,61 @@ fn propose_next_rollout(
         );
     }
     let plan = with_release_notes(plan)?;
-    let manifest = create_manifest_for_plan(cli, plan)?;
+    let mut manifest = create_manifest_for_plan(cli, plan)?;
+    let report = settings_report(cli, client, &manifest).unwrap_or_else(SettingsReport::failed);
+    manifest.settings_report = Some(report);
     publish_rollout(cli, client, &manifest)
+}
+
+/// Diffs the cluster's overridden settings against the target's defaults.
+/// Runs the downloaded target binary from a scratch dir in the versions dir,
+/// which the unit's sandbox lets the agent execute from.
+fn settings_report(
+    cli: &Cli,
+    client: &mut Client,
+    manifest: &RolloutManifest,
+) -> Result<SettingsReport, String> {
+    let overrides = settings::load_overrides(client).map_err(|error| error.to_string())?;
+    let installed = cockroach_binary(cli);
+    let installed_version =
+        installed_cockroach_version(&installed).map_err(|error| error.to_string())?;
+    if installed_version != manifest.current_version {
+        return Err(format!(
+            "this leader runs {installed_version}, not the rollout's starting version {}",
+            manifest.current_version
+        ));
+    }
+    let current = settings::gen_settings(&installed)?;
+
+    let arch = normalized_arch();
+    let artifact = manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.arch == arch)
+        .ok_or_else(|| format!("the manifest has no {arch} artifact"))?;
+    let versions_dir = BinaryLayout::new(&cli.agent_root).versions_dir();
+    let scratch = tempfile::Builder::new()
+        .prefix(".settings-diff-")
+        .tempdir_in(&versions_dir)
+        .map_err(|error| {
+            format!(
+                "cannot make a scratch dir in {}: {error}",
+                versions_dir.display()
+            )
+        })?;
+    run_command(
+        "tar",
+        [
+            "-xzf".as_ref(),
+            Path::new(&artifact.path).as_os_str(),
+            "-C".as_ref(),
+            scratch.path().as_os_str(),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    let binary = find_cockroach_binary(scratch.path()).map_err(|error| error.to_string())?;
+    let target = settings::gen_settings(&binary)?;
+    Ok(settings::diff(&overrides, &current, &target))
 }
 
 /// Records why no proposal was made, once per distinct reason: the leader
@@ -2208,6 +2268,7 @@ fn create_manifest_for_plan(cli: &Cli, plan: UpgradePlan) -> Result<RolloutManif
         release_note_warnings: plan.release_note_warnings,
         release_note_warnings_approved: false,
         artifacts,
+        settings_report: None,
     })
 }
 

@@ -367,6 +367,8 @@ fn action_form(action: &AvailableAction, csrf: &str) -> String {
             version,
             warnings,
             release_notes_url,
+            settings_warnings,
+            settings_info,
         } => {
             let version = escape(&version.to_string());
             let notes = if release_notes_url.starts_with("https://")
@@ -376,16 +378,40 @@ fn action_form(action: &AvailableAction, csrf: &str) -> String {
             } else {
                 String::new()
             };
-            let acknowledge = if warnings.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "<p class=\"warning\">Release notes matched: {}</p>\
-                     <label><input type=\"checkbox\" name=\"accept_warnings\" required> \
-                     I reviewed the release-note warnings</label>",
+            let mut acknowledge = String::new();
+            if !warnings.is_empty() {
+                let _ = write!(
+                    acknowledge,
+                    "<p class=\"warning\">Release notes matched: {}</p>",
                     escape(&warnings.join(", "))
-                )
-            };
+                );
+            }
+            if !settings_warnings.is_empty() {
+                acknowledge.push_str(
+                    "<p class=\"warning\">Overridden cluster settings this upgrade touches:</p><ul>",
+                );
+                for line in settings_warnings {
+                    let _ = write!(acknowledge, "<li>{}</li>", escape(line));
+                }
+                acknowledge.push_str("</ul>");
+            }
+            if !settings_info.is_empty() {
+                let _ = write!(
+                    acknowledge,
+                    "<details><summary>{} other defaults change</summary><ul>",
+                    settings_info.len()
+                );
+                for line in settings_info {
+                    let _ = write!(acknowledge, "<li>{}</li>", escape(line));
+                }
+                acknowledge.push_str("</ul></details>");
+            }
+            if !warnings.is_empty() || !settings_warnings.is_empty() {
+                acknowledge.push_str(
+                    "<label><input type=\"checkbox\" name=\"accept_warnings\" required> \
+                     I reviewed the warnings</label>",
+                );
+            }
             format!(
                 "<form method=\"post\" action=\"/actions/approve\" class=\"action\">{csrf}\
                  <input type=\"hidden\" name=\"version\" value=\"{version}\">\
@@ -476,6 +502,8 @@ mod tests {
             version: Version::new(25, 4, 17),
             warnings: Vec::new(),
             release_notes_url: "https://www.cockroachlabs.com/docs/releases/v25.4".to_string(),
+            settings_warnings: Vec::new(),
+            settings_info: Vec::new(),
         };
         let html = dashboard(&view, &[quiet], "tok", None);
         assert!(html.contains("action=\"/actions/approve\""));
@@ -486,6 +514,8 @@ mod tests {
             version: Version::new(25, 4, 17),
             warnings: vec!["removed".to_string()],
             release_notes_url: "javascript:alert(1)".to_string(),
+            settings_warnings: Vec::new(),
+            settings_info: Vec::new(),
         };
         let html = dashboard(&view, &[warned], "tok", None);
         assert!(html.contains("name=\"accept_warnings\""));
@@ -594,5 +624,27 @@ mod tests {
         assert!(html.contains("last check failed: &lt;rate limited&gt;"));
         assert!(html.contains("action=\"/actions/check-releases\""));
         assert_eq!(html.matches("name=\"csrf\" value=\"tok\"").count(), 2);
+    }
+
+    #[test]
+    fn settings_findings_show_on_the_approve_card() {
+        let view = ClusterView::sample();
+        let approve = AvailableAction::Approve {
+            version: Version::new(26, 1, 8),
+            warnings: Vec::new(),
+            release_notes_url: String::new(),
+            settings_warnings: vec!["kv.<x> is removed in the target".to_string()],
+            settings_info: vec![
+                "a default changes".to_string(),
+                "b default changes".to_string(),
+            ],
+        };
+        let html = dashboard(&view, &[approve], "tok", None);
+        assert!(html.contains("kv.&lt;x&gt; is removed in the target"));
+        assert!(
+            html.contains("name=\"accept_warnings\""),
+            "settings warnings need the checkbox"
+        );
+        assert!(html.contains("<details><summary>2 other defaults change</summary>"));
     }
 }
