@@ -387,12 +387,23 @@ pub fn stage(
         ),
         &[&info.fingerprint],
     )?;
+    let existing = tx.query(
+        &format!("SELECT status FROM {schema}.ui_certs WHERE fingerprint = $1"),
+        &[&info.fingerprint],
+    )?;
+    if let Some(row) = existing.first() {
+        // Dropping the transaction rolls back the supersede above.
+        let status: String = row.get(0);
+        return Err(AppError::Message(format!(
+            "certificate {} is already stored as {status}; stage a new one instead",
+            info.fingerprint
+        )));
+    }
     tx.execute(
         &format!(
             "INSERT INTO {schema}.ui_certs \
                 (fingerprint, cert_pem, key_pem, chain_pem, status, not_before, not_after, created_by) \
-             VALUES ($1, $2, $3, $4, 'staged', $5, $6, $7) \
-             ON CONFLICT (fingerprint) DO NOTHING"
+             VALUES ($1, $2, $3, $4, 'staged', $5, $6, $7)"
         ),
         &[
             &info.fingerprint,

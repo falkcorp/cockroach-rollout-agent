@@ -151,6 +151,11 @@ Treat a failed self-check as a blocker.
    proposes that version again. A newer patch is still proposed.
    `undecline <version>` reverses it.
 
+   **Upgrade every agent to 0.2.0 before you decline anything.** Agents
+   older than 0.2.0 don't know the `declined` status: their `status`
+   command and dashboard fail, and an old leader proposes the declined
+   version again.
+
 4. **Watch it.** Use `status`, `journalctl -u cockroach-rollout-agent -f`, and
    `/var/log/cockroach-rollout-agent/audit.log`.
 
