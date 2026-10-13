@@ -1,7 +1,7 @@
 // file: src/ops.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 2f1695d6-80fb-4adc-9927-98f3e3b1c028
-// last-edited: 2026-10-12
+// last-edited: 2026-10-13
 
 //! Operator actions shared by the CLI and the web UI. Every precondition is
 //! checked here, so the two paths can never enforce different rules.
@@ -9,6 +9,7 @@
 use postgres::Client;
 use semver::Version;
 
+use crate::agentupdate;
 use crate::cluster_view::{self, ClusterView, OpenSummary};
 use crate::events::{self, Source};
 use crate::releases;
@@ -400,6 +401,57 @@ pub fn check_releases(cli: &Cli, client: &mut Client, actor: &Actor) -> Result<S
         crate::DEFAULT_DAEMON_INTERVAL_SECONDS / 60,
         releases::CATALOG_MIN_REFRESH_SECS / 60
     ))
+}
+
+/// Approves or declines an agent release. Approval names the version, so it
+/// cannot land on a newer proposal than the one whose digests were reviewed.
+pub fn decide_agent_release(
+    cli: &Cli,
+    client: &mut Client,
+    actor: &Actor,
+    version: &str,
+    approve: bool,
+) -> Result<String, AppError> {
+    let by = actor.label(cli);
+    agentupdate::decide(cli, client, version, approve, &by)?;
+    let kind = if approve {
+        "agent_release_approved"
+    } else {
+        "agent_release_declined"
+    };
+    events::note(
+        cli,
+        client,
+        actor.source(),
+        kind,
+        &format!("version={version} by={by}"),
+    )?;
+    Ok(if approve {
+        format!(
+            "approved agent {version}; agents update one at a time, each on its next tick \
+             (about {} minutes apart)",
+            crate::DEFAULT_DAEMON_INTERVAL_SECONDS / 60
+        )
+    } else {
+        format!("declined agent {version}; agents that have not updated stay where they are")
+    })
+}
+
+/// Lets agents whose update failed try again.
+pub fn retry_agent_update(
+    cli: &Cli,
+    client: &mut Client,
+    actor: &Actor,
+) -> Result<String, AppError> {
+    let cleared = agentupdate::retry(cli, client)?;
+    events::note(
+        cli,
+        client,
+        actor.source(),
+        "agent_update_retry",
+        &format!("cleared={cleared} by={}", actor.label(cli)),
+    )?;
+    Ok(format!("{cleared} failed agent update(s) will be retried"))
 }
 
 /// Approves or rejects the staged UI certificate the operator looked at.

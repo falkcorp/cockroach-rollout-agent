@@ -1,7 +1,7 @@
 // file: src/web/mod.rs
-// version: 1.6.0
+// version: 1.7.0
 // guid: 5a0df256-3b3d-47c1-8da7-af41189b6592
-// last-edited: 2026-10-12
+// last-edited: 2026-10-13
 
 //! The built-in HTTPS dashboard.
 
@@ -114,6 +114,11 @@ pub enum WebAction {
         cert_pem: String,
         key_pem: String,
     },
+    AgentUpdateDecide {
+        version: String,
+        approve: bool,
+    },
+    AgentUpdateRetry,
 }
 
 pub fn parse_action(name: &str, form: &HashMap<String, String>) -> Result<WebAction, String> {
@@ -159,6 +164,18 @@ pub fn parse_action(name: &str, form: &HashMap<String, String>) -> Result<WebAct
             })
         }
         "ui-cert-upload" => Err("paste both the certificate and its key".to_string()),
+        "agent-update-approve" | "agent-update-decline"
+            if semver::Version::parse(field("version")).is_ok() =>
+        {
+            Ok(WebAction::AgentUpdateDecide {
+                version: field("version").to_string(),
+                approve: name == "agent-update-approve",
+            })
+        }
+        "agent-update-approve" | "agent-update-decline" => {
+            Err("the form is missing the agent release's version".to_string())
+        }
+        "agent-update-retry" => Ok(WebAction::AgentUpdateRetry),
         other => Err(format!("unknown action: {other}")),
     }
 }
@@ -773,6 +790,25 @@ mod tests {
         assert_eq!(
             parse_action("check-releases", &form(&[])),
             Ok(WebAction::CheckReleases)
+        );
+        assert_eq!(
+            parse_action("agent-update-approve", &form(&[("version", "0.3.1")])),
+            Ok(WebAction::AgentUpdateDecide {
+                version: "0.3.1".to_string(),
+                approve: true
+            })
+        );
+        assert_eq!(
+            parse_action("agent-update-decline", &form(&[("version", "0.3.1")])),
+            Ok(WebAction::AgentUpdateDecide {
+                version: "0.3.1".to_string(),
+                approve: false
+            })
+        );
+        assert!(parse_action("agent-update-approve", &form(&[("version", "latest")])).is_err());
+        assert_eq!(
+            parse_action("agent-update-retry", &form(&[])),
+            Ok(WebAction::AgentUpdateRetry)
         );
         let fp = "ab".repeat(32);
         assert_eq!(

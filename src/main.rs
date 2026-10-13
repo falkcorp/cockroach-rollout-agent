@@ -1,8 +1,9 @@
 // file: src/main.rs
-// version: 3.14.0
+// version: 3.15.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
-// last-edited: 2026-10-12
+// last-edited: 2026-10-13
 
+mod agentupdate;
 mod cluster_view;
 mod events;
 mod health;
@@ -22,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 use native_tls::{Certificate, Identity, TlsConnector};
@@ -34,9 +35,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::agentupdate::UpdateStep;
 use crate::events::Source;
 use crate::health::{ClusterHealth, safe_to_restart};
-use crate::layout::{BinaryLayout, probe_writable};
+use crate::layout::{AGENT_BINARY_NAME, BinaryLayout, probe_writable};
 use crate::ops::Actor;
 use crate::rollout::{
     FollowerAction, LeaderAction, NodeObservation, RestartAction, RolloutKind, RolloutStatus,
@@ -49,6 +51,10 @@ const DEFAULT_BASE_URL: &str = "https://binaries.cockroachdb.com";
 const DEFAULT_GITHUB_API_URL: &str =
     "https://api.github.com/repos/cockroachdb/cockroach/tags?per_page=100";
 const DEFAULT_RELEASE_NOTES_BASE_URL: &str = "https://www.cockroachlabs.com/docs/releases";
+const DEFAULT_AGENT_RELEASE_URL: &str =
+    "https://api.github.com/repos/falkcorp/cockroach-rollout-agent/releases/latest";
+/// The agent's own unit; its `ExecStart` must run the agent layout's link.
+const AGENT_UNIT: &str = "cockroach-rollout-agent.service";
 const DEFAULT_ARTIFACTS_DIR: &str = "dist";
 const DEFAULT_AUDIT_LOG: &str = "/var/log/cockroach-rollout-agent/audit.log";
 const DEFAULT_MANIFEST_PATH: &str = "dist/manifest.json";
@@ -101,6 +107,15 @@ struct Cli {
         default_value = DEFAULT_RELEASE_NOTES_BASE_URL
     )]
     release_notes_base_url: String,
+
+    /// GitHub "latest release" endpoint for this agent. Only stable releases
+    /// are proposed, and each still needs an operator's approval.
+    #[arg(
+        long,
+        env = "CROACH_ROLLOUT_AGENT_RELEASE_URL",
+        default_value = DEFAULT_AGENT_RELEASE_URL
+    )]
+    agent_release_url: String,
 
     #[arg(
         long,
@@ -285,6 +300,18 @@ enum Commands {
         action: UiCertCommand,
     },
 
+    /// Update the agents themselves: approve or decline the release the
+    /// leader proposed, and retry agents whose update failed.
+    AgentUpdate {
+        #[command(subcommand)]
+        action: AgentUpdateCommand,
+    },
+
+    /// Run by the agent unit before every start: counts starts of a freshly
+    /// updated binary and restores the previous one if it never settles.
+    #[command(hide = true)]
+    AgentPreflight,
+
     /// Show rollouts, cluster nodes, agents, and lease holders.
     Status,
 
@@ -336,6 +363,22 @@ enum UiCertCommand {
     Reject { fingerprint: String },
     /// Show the approved and staged certificates.
     Show,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum AgentUpdateCommand {
+    /// Show agent releases and each agent's version.
+    Show,
+    /// Approve the proposed release; agents update one at a time.
+    Approve {
+        /// The proposed version, as shown by `agent-update show`.
+        version: String,
+    },
+    /// Decline a proposed release, or stop an approved one: agents that have
+    /// not updated yet stay where they are.
+    Decline { version: String },
+    /// Let agents whose update failed try again.
+    Retry,
 }
 
 #[derive(Debug, Error)]
@@ -489,6 +532,11 @@ fn run() -> Result<(), AppError> {
         Commands::RestartCluster => restart_cluster_command(&cli),
         Commands::SetUiPassword => set_ui_password_command(&cli),
         Commands::UiCert { action } => ui_cert_command(&cli, action),
+        Commands::AgentUpdate { action } => agent_update_command(&cli, action),
+        Commands::AgentPreflight => {
+            agent_preflight_command(&cli);
+            Ok(())
+        }
         Commands::Status => status_command(&cli),
         Commands::InitDb => init_db_command(&cli),
         Commands::Discover => discover_command(&cli),
@@ -776,13 +824,44 @@ fn db_daemon_command(
     // Dry runs promise to write nothing, and UI actions write.
     let ui = if dry_run { None } else { start_web_ui(cli)? };
 
+    let layout = BinaryLayout::agent(&cli.agent_root);
+    // Left by `agent-preflight` after it restored this binary; reported once
+    // the DB is reachable, and it keeps the failed version from retrying.
+    let mut rolled_back = agentupdate::take_rolled_back(&layout).unwrap_or_else(|error| {
+        eprintln!("cannot read the rollback note: {error}");
+        None
+    });
+    // This binary was just swapped in: it must finish a tick in time, or
+    // exit so that `agent-preflight` counts the start towards a rollback.
+    let mut confirm_by = match agentupdate::read_pending(&layout) {
+        Ok(Some(pending)) if pending.to == agentupdate::own_version() => {
+            Some(Instant::now() + Duration::from_secs(agentupdate::CONFIRM_DEADLINE_SECS))
+        }
+        Ok(Some(_)) | Err(_) => {
+            // Left over from an update that never swapped; nothing to confirm.
+            let _ = agentupdate::remove_file_if_present(&agentupdate::pending_path(&layout));
+            None
+        }
+        Ok(None) => None,
+    };
+
     let mut schema_ready = false;
     loop {
-        let result = (|| -> Result<(), AppError> {
+        let result = (|| -> Result<bool, AppError> {
             let mut client = db_client(cli)?;
             if !schema_ready && !dry_run {
                 ensure_schema(cli, &mut client)?;
                 schema_ready = true;
+            }
+            if let Some(message) = &rolled_back {
+                agentupdate::set_error(cli, &mut client, &agent_id, Some(message))?;
+                events::note(
+                    cli,
+                    &mut client,
+                    Source::Agent,
+                    "agent_update_rolled_back",
+                    message,
+                )?;
             }
             db_daemon_tick(
                 cli,
@@ -793,9 +872,34 @@ fn db_daemon_command(
                 ui.as_deref(),
             )
         })();
-        if let Err(error) = result {
-            audit(cli, "db_daemon_tick_failed", &error.to_string())?;
-            eprintln!("db daemon tick failed: {error}");
+        match result {
+            Ok(restart) => {
+                rolled_back = None;
+                if confirm_by.take().is_some() {
+                    agentupdate::remove_file_if_present(&agentupdate::pending_path(&layout))?;
+                    audit(cli, "agent_update_confirmed", env!("CARGO_PKG_VERSION"))?;
+                }
+                if restart {
+                    audit(
+                        cli,
+                        "agent_restart",
+                        "exiting for systemd to start the new binary",
+                    )?;
+                    std::process::exit(i32::from(agentupdate::RESTART_EXIT_CODE));
+                }
+            }
+            Err(error) => {
+                audit(cli, "db_daemon_tick_failed", &error.to_string())?;
+                eprintln!("db daemon tick failed: {error}");
+                if confirm_by.is_some_and(|deadline| Instant::now() >= deadline) {
+                    audit(
+                        cli,
+                        "agent_update_unconfirmed",
+                        "no good tick since the update; exiting so preflight can roll back",
+                    )?;
+                    std::process::exit(1);
+                }
+            }
         }
         thread::sleep(Duration::from_secs(interval_seconds));
     }
@@ -808,7 +912,7 @@ fn db_daemon_tick(
     dry_run: bool,
     auto_finalize: bool,
     ui: Option<&web::UiServer>,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let installed = installed_cockroach_version(&cockroach_binary(cli))?;
 
     if dry_run {
@@ -835,14 +939,300 @@ fn db_daemon_tick(
                 "leader_observed",
                 &format!("holder={}", lease.holder_id),
             )?;
-            return follower_reconcile(cli, client, agent_id, false);
+            follower_reconcile(cli, client, agent_id, false)?;
+            return agent_self_update(cli, client, agent_id);
         }
         events::prune(cli, client)?;
         refresh_catalog_if_due(cli, client)?;
     }
 
     leader_reconcile(cli, client, auto_finalize, dry_run)?;
-    follower_reconcile(cli, client, agent_id, dry_run)
+    follower_reconcile(cli, client, agent_id, dry_run)?;
+    if dry_run {
+        return Ok(false);
+    }
+    agent_self_update(cli, client, agent_id)
+}
+
+/// Updates this agent's own binary when a newer release is approved and no
+/// other agent is mid-update. Runs at the end of a tick, so this agent is
+/// never in the middle of a CockroachDB upgrade or restart. Returns true when
+/// the new binary is in place and the agent must exit for systemd to start it.
+fn agent_self_update(cli: &Cli, client: &mut Client, agent_id: &str) -> Result<bool, AppError> {
+    let own = agentupdate::own_version();
+    let approved = agentupdate::newest_approved(cli, client)?;
+    let target = approved.as_ref().map(|release| &release.version);
+    let marker = agentupdate::marker(cli, client, agent_id)?;
+    let in_flight = match target {
+        Some(target) => agentupdate::in_flight(cli, client, agent_id, target)?,
+        None => Vec::new(),
+    };
+    let layout_problem = agent_layout_problem(cli);
+    if marker.is_none() {
+        // A note that blocks nobody: shows which nodes still need the
+        // one-time reinstall onto the agent layout.
+        agentupdate::set_error(cli, client, agent_id, layout_problem.as_deref())?;
+    }
+    match agentupdate::update_step(&own, target, marker.as_ref(), &in_flight) {
+        UpdateStep::Nothing => Ok(false),
+        UpdateStep::Clear { confirmed } => {
+            agentupdate::clear_marker(cli, client, agent_id)?;
+            if confirmed {
+                events::note(
+                    cli,
+                    client,
+                    Source::Agent,
+                    "agent_updated",
+                    &format!("now running {own}"),
+                )?;
+            }
+            Ok(false)
+        }
+        UpdateStep::Blocked(reason) => {
+            audit(cli, "agent_update_waiting", &reason)?;
+            Ok(false)
+        }
+        UpdateStep::Start(target) => {
+            if layout_problem.is_some() {
+                return Ok(false);
+            }
+            if lease_holder(cli, client, INSTALL_LEASE)?.as_deref() == Some(agent_id) {
+                return Ok(false);
+            }
+            let release = approved.expect("Start implies an approved release");
+            // Before the claim: a failed download is retried next tick and
+            // must not hold the other agents back.
+            let tarball = match download_agent_release(cli, &release) {
+                Ok(path) => path,
+                Err(error) => {
+                    audit(cli, "agent_update_download_failed", &error.to_string())?;
+                    return Ok(false);
+                }
+            };
+            if !agentupdate::claim(cli, client, agent_id, &target)? {
+                return Ok(false);
+            }
+            events::note(
+                cli,
+                client,
+                Source::Agent,
+                "agent_update_started",
+                &format!("{own} -> {target}"),
+            )?;
+            match install_agent_release(cli, &release, &tarball) {
+                Ok(()) => {
+                    events::note(
+                        cli,
+                        client,
+                        Source::Agent,
+                        "agent_update_restarting",
+                        &format!("{own} -> {target}"),
+                    )?;
+                    Ok(true)
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    agentupdate::set_error(cli, client, agent_id, Some(&message))?;
+                    events::note(cli, client, Source::Agent, "agent_update_failed", &message)?;
+                    Ok(false)
+                }
+            }
+        }
+    }
+}
+
+/// Why this agent cannot update itself, if it cannot: it must be running
+/// from the agent layout, which `install-rollout-agent.sh` sets up once.
+fn agent_layout_problem(cli: &Cli) -> Option<String> {
+    let layout = BinaryLayout::agent(&cli.agent_root);
+    let running = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => return Some(format!("cannot tell which binary is running: {error}")),
+    };
+    let versions = fs::canonicalize(layout.versions_dir()).unwrap_or(layout.versions_dir());
+    if running.starts_with(&versions) {
+        None
+    } else {
+        Some(format!(
+            "runs {}, not {}; rerun install-rollout-agent.sh once to enable self-update",
+            running.display(),
+            layout.current_link().display()
+        ))
+    }
+}
+
+/// Downloads the approved build for this architecture into the agent's
+/// layout. Nothing is trusted yet; `install_agent_release` checks it.
+fn download_agent_release(
+    cli: &Cli,
+    release: &agentupdate::AgentReleaseRow,
+) -> Result<PathBuf, AppError> {
+    let arch = normalized_arch();
+    let asset = release.assets.get(&arch).ok_or_else(|| {
+        AppError::Message(format!("v{} has no linux/{arch} build", release.version))
+    })?;
+    let tarball = BinaryLayout::agent(&cli.agent_root)
+        .root()
+        .join("downloads")
+        .join(agentupdate::tarball_name(&arch));
+    download_public(&asset.url, &tarball)?;
+    Ok(tarball)
+}
+
+/// Checks the downloaded build against the approved digest, proves the new
+/// binary runs here, and swaps the agent link. The caller exits so systemd
+/// starts the new binary. Any failure here stops the update on every node
+/// until an operator retries it.
+fn install_agent_release(
+    cli: &Cli,
+    release: &agentupdate::AgentReleaseRow,
+    tarball: &Path,
+) -> Result<(), AppError> {
+    let arch = normalized_arch();
+    let asset = release.assets.get(&arch).ok_or_else(|| {
+        AppError::Message(format!("v{} has no linux/{arch} build", release.version))
+    })?;
+    let layout = BinaryLayout::agent(&cli.agent_root);
+    let (sha256, _) = sha256_file(tarball)?;
+    if sha256 != asset.sha256 {
+        let _ = fs::remove_file(tarball);
+        return Err(AppError::Message(format!(
+            "the download of v{} does not match the approved digest: approved={} downloaded={sha256}",
+            release.version, asset.sha256
+        )));
+    }
+
+    let scratch = tempfile::Builder::new()
+        .prefix(".extract-")
+        .tempdir_in(layout.root())?;
+    run_command(
+        "tar",
+        [
+            "-xzf".as_ref(),
+            tarball.as_os_str(),
+            "-C".as_ref(),
+            scratch.path().as_os_str(),
+        ],
+    )?;
+    let extracted = find_binary(scratch.path(), AGENT_BINARY_NAME)?;
+    let output = Command::new(&extracted)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()?;
+    let reported = agentupdate::version_from_output(&String::from_utf8_lossy(&output.stdout));
+    if !output.status.success() || reported.as_ref() != Some(&release.version) {
+        return Err(AppError::Message(format!(
+            "the new binary reports {}, expected {}",
+            reported
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "no version".to_string()),
+            release.version
+        )));
+    }
+    if !command_status(
+        extracted.as_os_str().to_string_lossy().as_ref(),
+        ["self-check"],
+    )? {
+        return Err(AppError::Message(format!(
+            "v{} failed self-check on this node; see the agent's journal",
+            release.version
+        )));
+    }
+
+    layout.stage(&extracted, &release.version)?;
+    let from = layout.current_target_name()?;
+    // Written before the swap, so a new binary that never settles is always
+    // counted and rolled back by `agent-preflight`.
+    agentupdate::write_pending(
+        &layout,
+        &agentupdate::Pending {
+            from: from.clone(),
+            to: release.version.clone(),
+            starts: 0,
+        },
+    )?;
+    if let Err(error) = layout.activate(&release.version) {
+        // Nothing was swapped, so there is nothing for preflight to undo.
+        let _ = agentupdate::remove_file_if_present(&agentupdate::pending_path(&layout));
+        return Err(error.into());
+    }
+    audit(
+        cli,
+        "agent_update_swapped",
+        &format!("from={from} to={}", release.version),
+    )?;
+    if let Err(error) = layout.prune(Some(&from)) {
+        audit(cli, "agent_prune_failed", &error.to_string())?;
+    }
+    let _ = fs::remove_file(tarball);
+    Ok(())
+}
+
+/// `agent-preflight`: never fails, so a problem here cannot stop the agent
+/// from starting.
+fn agent_preflight_command(cli: &Cli) {
+    let layout = BinaryLayout::agent(&cli.agent_root);
+    match agentupdate::preflight(&layout) {
+        Ok(agentupdate::Preflight::Idle) => {}
+        Ok(agentupdate::Preflight::Counted(starts)) => {
+            eprintln!("agent-preflight: start {starts} of an unconfirmed update");
+        }
+        Ok(agentupdate::Preflight::RolledBack { message }) => {
+            eprintln!("agent-preflight: rolled back: {message}");
+            let _ = audit(cli, "agent_update_rolled_back", &message);
+        }
+        Err(error) => eprintln!("agent-preflight: {error}"),
+    }
+}
+
+fn agent_update_command(cli: &Cli, action: &AgentUpdateCommand) -> Result<(), AppError> {
+    with_client(cli, |client| match action {
+        AgentUpdateCommand::Show => agent_update_report(cli, client),
+        AgentUpdateCommand::Approve { version } => {
+            ops::decide_agent_release(cli, client, &Actor::Cli, version, true)
+        }
+        AgentUpdateCommand::Decline { version } => {
+            ops::decide_agent_release(cli, client, &Actor::Cli, version, false)
+        }
+        AgentUpdateCommand::Retry => ops::retry_agent_update(cli, client, &Actor::Cli),
+    })
+}
+
+fn agent_update_report(cli: &Cli, client: &mut Client) -> Result<String, AppError> {
+    use std::fmt::Write as _;
+    let view = cluster_view::load(cli, client)?;
+    let mut out = String::from("AGENT RELEASES (newest first)\n");
+    for row in view.agent_releases.iter().take(agentupdate::RELEASES_SHOWN) {
+        let _ = writeln!(
+            out,
+            "  v{:<10} {:<10} proposed {}{}",
+            row.version,
+            row.status,
+            row.proposed_at,
+            row.decided_by
+                .as_deref()
+                .map(|by| format!(", decided by {by}"))
+                .unwrap_or_default()
+        );
+        for (arch, asset) in &row.assets {
+            let _ = writeln!(out, "             {arch:<6} sha256 {}", asset.sha256);
+        }
+        let _ = writeln!(out, "             {}", row.html_url);
+    }
+    out.push_str("\nAGENTS\n");
+    for agent in &view.agents {
+        let _ = writeln!(
+            out,
+            "  {:<28} {:<10} {}",
+            agent.observation.agent_id,
+            agent.observation.agent_version.as_deref().unwrap_or("?"),
+            agentupdate::progress(
+                agent.agent_update_to.as_deref(),
+                agent.agent_update_error.as_deref()
+            )
+        );
+    }
+    Ok(out.trim_end().to_string())
 }
 
 /// Installs the approved UI certificate when it is not the one being served.
@@ -981,14 +1371,58 @@ fn refresh_catalog_if_due(cli: &Cli, client: &mut Client) -> Result<(), AppError
                 cli,
                 "release_catalog_fetched",
                 &format!("versions={}", versions.len()),
-            )
+            )?;
         }
         Err(error) => {
             let error = error.to_string();
             releases::store_catalog_error(cli, client, &error)?;
-            audit(cli, "release_catalog_failed", &error)
+            audit(cli, "release_catalog_failed", &error)?;
         }
     }
+    // Same cadence as the CockroachDB catalog, and the same "Check now".
+    if let Err(error) = check_agent_release(cli, client) {
+        note_changed(
+            cli,
+            client,
+            "agent_release_check_failed",
+            &error.to_string(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Proposes the newest stable agent release, pinned to the digests in its
+/// `SHA256SUMS`, when it is newer than this agent and not yet known.
+fn check_agent_release(cli: &Cli, client: &mut Client) -> Result<(), AppError> {
+    let listing = agentupdate::parse_release(&fetch_public_text(&cli.agent_release_url)?)
+        .map_err(AppError::Message)?;
+    let known = agentupdate::known_versions(cli, client)?;
+    if !agentupdate::should_propose(&listing.version, &agentupdate::own_version(), &known) {
+        return Ok(());
+    }
+    let sums_url = listing
+        .assets
+        .get("SHA256SUMS")
+        .ok_or_else(|| AppError::Message(format!("v{} has no SHA256SUMS", listing.version)))?;
+    let sums =
+        agentupdate::parse_sha256sums(&fetch_public_text(sums_url)?).map_err(AppError::Message)?;
+    let release = agentupdate::pin_assets(&listing, &sums).map_err(AppError::Message)?;
+    if agentupdate::store_proposal(cli, client, &release, &agent_node_id(cli)?)? {
+        let digests = release
+            .assets
+            .iter()
+            .map(|(arch, asset)| format!("{arch}={}", asset.sha256))
+            .collect::<Vec<_>>()
+            .join(" ");
+        events::note(
+            cli,
+            client,
+            Source::Agent,
+            "agent_update_proposed",
+            &format!("v{} {digests}", release.version),
+        )?;
+    }
+    Ok(())
 }
 
 fn leader_reconcile(
@@ -1214,9 +1648,14 @@ fn settings_report(
 /// Records why no proposal was made, once per distinct reason: the leader
 /// re-checks every tick, and the reason rarely changes between ticks.
 fn note_skip(cli: &Cli, client: &mut Client, detail: &str) -> Result<(), AppError> {
-    let last = events::last_detail(cli, client, "proposal_skipped")?;
+    note_changed(cli, client, "proposal_skipped", detail)
+}
+
+/// Records an event of `kind` unless the newest one already says `detail`.
+fn note_changed(cli: &Cli, client: &mut Client, kind: &str, detail: &str) -> Result<(), AppError> {
+    let last = events::last_detail(cli, client, kind)?;
     if should_note(last.as_deref(), &sanitize_log_field(detail)) {
-        events::note(cli, client, Source::Agent, "proposal_skipped", detail)?;
+        events::note(cli, client, Source::Agent, kind, detail)?;
     }
     Ok(())
 }
@@ -1605,7 +2044,7 @@ fn upgrade_node(
     let target = &manifest.target_version;
 
     // Rollback must be possible before anything changes.
-    let rollback_name = BinaryLayout::version_file_name(from);
+    let rollback_name = layout.version_file_name(from);
     if !layout.version_path(from).is_file() {
         return Err(AppError::Message(format!(
             "refusing to upgrade: rollback binary {} is missing",
@@ -2017,6 +2456,24 @@ fn ensure_schema(cli: &Cli, client: &mut Client) -> Result<(), AppError> {
                 refresh_requested_at TIMESTAMPTZ NULL,
                 last_error STRING NULL
             )"
+        ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.agent_releases (
+                version STRING PRIMARY KEY,
+                status STRING NOT NULL,
+                html_url STRING NOT NULL,
+                assets_json STRING NOT NULL,
+                proposed_by STRING NOT NULL,
+                proposed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                decided_by STRING NULL,
+                decided_at TIMESTAMPTZ NULL
+            )"
+        ),
+        format!(
+            "ALTER TABLE {schema}.agent_status ADD COLUMN IF NOT EXISTS agent_update_to STRING NULL"
+        ),
+        format!(
+            "ALTER TABLE {schema}.agent_status ADD COLUMN IF NOT EXISTS agent_update_error STRING NULL"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {schema}.events (
@@ -2626,10 +3083,24 @@ fn self_check_command(cli: &Cli) -> Result<(), AppError> {
             }),
         );
     }
+    let agent_layout = BinaryLayout::agent(&cli.agent_root);
+    check(
+        "agent layout",
+        service_exec_path(AGENT_UNIT).and_then(|exec_path| {
+            agent_layout.verify_wired(&exec_path).map(|()| {
+                format!(
+                    "{AGENT_UNIT} runs {}",
+                    agent_layout.current_link().display()
+                )
+            })
+        }),
+    );
     for dir in [
         layout.bin_dir(),
         layout.versions_dir(),
         cli.artifacts_dir.clone(),
+        agent_layout.bin_dir(),
+        agent_layout.versions_dir(),
     ] {
         check(
             &format!("writable {}", dir.display()),
@@ -3320,6 +3791,33 @@ fn download_to_file(url: &str, destination: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Downloads without the manifest PSK: release assets live on GitHub, which
+/// must never see that credential.
+fn download_public(url: &str, destination: &Path) -> Result<(), AppError> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut response = reqwest::blocking::Client::new()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "cockroach-rollout-agent")
+        .send()?
+        .error_for_status()?;
+    let mut output = fs::File::create(destination)?;
+    io::copy(&mut response, &mut output)?;
+    output.sync_all()?;
+    Ok(())
+}
+
+/// Like `fetch_text`, without the manifest PSK.
+fn fetch_public_text(url: &str) -> Result<String, AppError> {
+    Ok(reqwest::blocking::Client::new()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "cockroach-rollout-agent")
+        .send()?
+        .error_for_status()?
+        .text()?)
+}
+
 fn fetch_text(url: &str) -> Result<String, AppError> {
     let request = reqwest::blocking::Client::new()
         .get(url)
@@ -3367,6 +3865,11 @@ fn verify_artifact(path: &Path, artifact: &Artifact) -> Result<(), AppError> {
 }
 
 fn find_cockroach_binary(root: &Path) -> Result<PathBuf, AppError> {
+    find_binary(root, "cockroach")
+}
+
+/// The first file called `name` anywhere under `root`.
+fn find_binary(root: &Path, name: &str) -> Result<PathBuf, AppError> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
         for entry in fs::read_dir(&path)? {
@@ -3376,14 +3879,14 @@ fn find_cockroach_binary(root: &Path) -> Result<PathBuf, AppError> {
                 stack.push(entry_path);
             } else if entry_path
                 .file_name()
-                .is_some_and(|name| name == "cockroach")
+                .is_some_and(|file_name| file_name == name)
             {
                 return Ok(entry_path);
             }
         }
     }
     Err(AppError::Message(format!(
-        "no cockroach binary found under {}",
+        "no {name} binary found under {}",
         root.display()
     )))
 }
