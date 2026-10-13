@@ -1,7 +1,7 @@
 // file: src/events.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 4081c194-4ba9-4683-8e2e-d1b605dbf4f7
-// last-edited: 2026-10-11
+// last-edited: 2026-10-12
 
 //! The cluster-wide event log. The audit log is a file on each host, so
 //! without this a dashboard on one node cannot see what agents on the other
@@ -65,6 +65,18 @@ pub fn note(
 ) -> Result<(), AppError> {
     audit(cli, kind, detail)?;
     record_event(cli, client, source, kind, detail)
+}
+
+/// The newest event's detail of `kind`, for skip-note dedupe.
+pub fn last_detail(cli: &Cli, client: &mut Client, kind: &str) -> Result<Option<String>, AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    Ok(client
+        .query(
+            &format!("SELECT detail FROM {schema}.events WHERE kind = $1 ORDER BY at DESC LIMIT 1"),
+            &[&kind],
+        )?
+        .first()
+        .map(|row| row.get(0)))
 }
 
 /// Leader housekeeping: keep the newest `EVENTS_KEPT` events and drop

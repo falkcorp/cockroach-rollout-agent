@@ -1,7 +1,7 @@
 // file: src/main.rs
-// version: 3.13.0
+// version: 3.14.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
-// last-edited: 2026-10-11
+// last-edited: 2026-10-12
 
 mod cluster_view;
 mod events;
@@ -37,8 +37,8 @@ use crate::layout::{BinaryLayout, probe_writable};
 use crate::ops::Actor;
 use crate::rollout::{
     FollowerAction, LeaderAction, NodeObservation, RestartAction, RolloutKind, RolloutStatus,
-    all_nodes_on, follower_action, leader_action, live_version_span, restart_action,
-    restart_complete, restarted_on,
+    all_nodes_on, follower_action, leader_action, live_version_span, proposal_declined,
+    restart_action, restart_complete, restarted_on, should_note,
 };
 
 const DEFAULT_BASE_URL: &str = "https://binaries.cockroachdb.com";
@@ -247,6 +247,18 @@ enum Commands {
         accept_release_note_warnings: bool,
     },
 
+    /// Decline the proposed rollout; the leader will not propose its target again.
+    Decline {
+        #[arg(long, default_value = "declined by operator")]
+        reason: String,
+    },
+
+    /// Allow a declined version to be proposed again.
+    Undecline {
+        /// The declined target version, for example 26.1.8.
+        version: String,
+    },
+
     /// Cancel the open rollout. Nodes already upgraded stay upgraded.
     Cancel {
         #[arg(long, default_value = "cancelled by operator")]
@@ -428,6 +440,12 @@ fn run() -> Result<(), AppError> {
             version,
             accept_release_note_warnings,
         } => approve_command(&cli, version, *accept_release_note_warnings),
+        Commands::Decline { reason } => with_client(&cli, |client| {
+            ops::decline(&cli, client, &Actor::Cli, None, reason)
+        }),
+        Commands::Undecline { version } => with_client(&cli, |client| {
+            ops::undecline(&cli, client, &Actor::Cli, version)
+        }),
         Commands::Cancel { reason } => cancel_command(&cli, reason),
         Commands::RestartCluster => restart_cluster_command(&cli),
         Commands::SetUiPassword => set_ui_password_command(&cli),
@@ -880,17 +898,13 @@ fn propose_next_rollout(
 ) -> Result<(), AppError> {
     let (oldest, newest) = match live_version_span(nodes) {
         Ok(span) => span,
-        Err(reason) => {
-            return events::note(cli, client, Source::Agent, "proposal_skipped", &reason);
-        }
+        Err(reason) => return note_skip(cli, client, &reason),
     };
     let Some(plan) = next_upgrade_plan(cli, Some(&oldest.to_string()), None)? else {
         if newest != oldest {
-            return events::note(
+            return note_skip(
                 cli,
                 client,
-                Source::Agent,
-                "proposal_skipped",
                 &format!("nodes run {oldest} and {newest}, but {oldest} needs no upgrade step"),
             );
         }
@@ -899,19 +913,37 @@ fn propose_next_rollout(
     // A partially applied upgrade is resumed only when the nodes already
     // ahead run exactly this step's target; they then count as done.
     if newest != oldest && plan.next_version != newest {
-        return events::note(
+        return note_skip(
             cli,
             client,
-            Source::Agent,
-            "proposal_skipped",
             &format!(
                 "nodes run {oldest} and {newest}, but the next step from {oldest} is {}; finish or revert the partial upgrade by hand",
                 plan.next_version
             ),
         );
     }
+    if proposal_declined(&plan.next_version, &ops::declined_targets(cli, client)?) {
+        return note_skip(
+            cli,
+            client,
+            &format!(
+                "{oldest} -> {} was declined; undo with: cockroach-rollout-agent undecline {}",
+                plan.next_version, plan.next_version
+            ),
+        );
+    }
     let manifest = create_manifest_for_plan(cli, plan)?;
     publish_rollout(cli, client, &manifest)
+}
+
+/// Records why no proposal was made, once per distinct reason: the leader
+/// re-checks every tick, and the reason rarely changes between ticks.
+fn note_skip(cli: &Cli, client: &mut Client, detail: &str) -> Result<(), AppError> {
+    let last = events::last_detail(cli, client, "proposal_skipped")?;
+    if should_note(last.as_deref(), &sanitize_log_field(detail)) {
+        events::note(cli, client, Source::Agent, "proposal_skipped", detail)?;
+    }
+    Ok(())
 }
 
 fn follower_reconcile(
@@ -1420,6 +1452,17 @@ fn approve_command(
             accept_release_note_warnings
         )?
     );
+    Ok(())
+}
+
+/// Runs one operator action against a fresh connection and prints its message.
+fn with_client(
+    cli: &Cli,
+    action: impl FnOnce(&mut Client) -> Result<String, AppError>,
+) -> Result<(), AppError> {
+    let mut client = db_client(cli)?;
+    ensure_schema(cli, &mut client)?;
+    println!("{}", action(&mut client)?);
     Ok(())
 }
 

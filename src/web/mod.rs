@@ -1,7 +1,7 @@
 // file: src/web/mod.rs
-// version: 1.5.1
+// version: 1.6.0
 // guid: 5a0df256-3b3d-47c1-8da7-af41189b6592
-// last-edited: 2026-10-11
+// last-edited: 2026-10-12
 
 //! The built-in HTTPS dashboard.
 
@@ -50,6 +50,10 @@ pub enum WebAction {
         version: String,
         accept_warnings: bool,
     },
+    Decline {
+        rollout_id: String,
+        reason: String,
+    },
     Cancel {
         reason: String,
     },
@@ -67,6 +71,14 @@ pub fn parse_action(name: &str, form: &HashMap<String, String>) -> Result<WebAct
             accept_warnings: field("accept_warnings") == "on",
         }),
         "approve" => Err("the approval form is missing the version".to_string()),
+        "decline" if !field("rollout_id").is_empty() => Ok(WebAction::Decline {
+            rollout_id: field("rollout_id").to_string(),
+            reason: match field("reason") {
+                "" => "declined from the dashboard".to_string(),
+                reason => reason.to_string(),
+            },
+        }),
+        "decline" => Err("the decline form is missing the rollout id".to_string()),
         "cancel" if !field("reason").is_empty() => Ok(WebAction::Cancel {
             reason: field("reason").to_string(),
         }),
@@ -527,6 +539,25 @@ mod tests {
             parse_action("restart", &form(&[("confirm", "restart")])),
             Ok(WebAction::Restart)
         );
+        assert_eq!(
+            parse_action(
+                "decline",
+                &form(&[("rollout_id", "r1"), ("reason", " not yet ")])
+            ),
+            Ok(WebAction::Decline {
+                rollout_id: "r1".to_string(),
+                reason: "not yet".to_string()
+            })
+        );
+        assert_eq!(
+            parse_action("decline", &form(&[("rollout_id", "r1")])),
+            Ok(WebAction::Decline {
+                rollout_id: "r1".to_string(),
+                reason: "declined from the dashboard".to_string()
+            }),
+            "the reason is optional"
+        );
+        assert!(parse_action("decline", &form(&[("reason", "x")])).is_err());
         assert!(parse_action("drop-table", &form(&[])).is_err());
     }
 }

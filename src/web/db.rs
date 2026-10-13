@@ -1,7 +1,7 @@
 // file: src/web/db.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 143f3009-b250-465e-80ae-1e93b2544162
-// last-edited: 2026-10-11
+// last-edited: 2026-10-12
 
 //! `Backend` over the coordination database. Every method opens its own
 //! connection; the caller runs it inside `spawn_blocking`, so the blocking
@@ -126,6 +126,9 @@ impl Backend for DbBackend {
                 version,
                 accept_warnings,
             } => ops::approve(cli, &mut client, actor, &version, accept_warnings),
+            WebAction::Decline { rollout_id, reason } => {
+                ops::decline(cli, &mut client, actor, Some(&rollout_id), &reason)
+            }
             WebAction::Cancel { reason } => ops::cancel(cli, &mut client, actor, &reason),
             WebAction::Finalize { confirm_version } => {
                 ops::finalize(cli, &mut client, actor, &confirm_version, false)
