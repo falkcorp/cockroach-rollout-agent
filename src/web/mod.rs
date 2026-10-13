@@ -61,6 +61,7 @@ pub enum WebAction {
         confirm_version: String,
     },
     Restart,
+    CheckReleases,
 }
 
 pub fn parse_action(name: &str, form: &HashMap<String, String>) -> Result<WebAction, String> {
@@ -89,6 +90,7 @@ pub fn parse_action(name: &str, form: &HashMap<String, String>) -> Result<WebAct
         "finalize" => Err("type the target version to confirm finalizing".to_string()),
         "restart" if field("confirm") == "restart" => Ok(WebAction::Restart),
         "restart" => Err("type restart to confirm a rolling restart".to_string()),
+        "check-releases" => Ok(WebAction::CheckReleases),
         other => Err(format!("unknown action: {other}")),
     }
 }
@@ -558,6 +560,10 @@ mod tests {
             "the reason is optional"
         );
         assert!(parse_action("decline", &form(&[("reason", "x")])).is_err());
+        assert_eq!(
+            parse_action("check-releases", &form(&[])),
+            Ok(WebAction::CheckReleases)
+        );
         assert!(parse_action("drop-table", &form(&[])).is_err());
     }
 }

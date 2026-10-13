@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use crate::cluster_view::{AgentRow, ClusterView, EventRow, LeaseRow, RolloutRow};
 use crate::health::safe_to_restart;
 use crate::ops::AvailableAction;
+use crate::releases::{LineMark, ReleasesView};
 use crate::rollout::NodeObservation;
 
 pub const APP_CSS: &str = include_str!("assets/app.css");
@@ -96,6 +97,9 @@ pub fn dashboard(
     }
     main.push_str(&actions_section(actions, csrf));
     main.push_str(&rollouts_section(&view.rollouts));
+    if let Some(releases) = &view.releases {
+        main.push_str(&releases_section(releases, csrf));
+    }
     main.push_str(&nodes_section(&view.nodes));
     main.push_str(&agents_section(&view.agents, view.stale_after_secs));
     main.push_str(&locks_section(&view.leases));
@@ -155,6 +159,75 @@ fn rollouts_section(rollouts: &[RolloutRow]) -> String {
         rows,
         "No rollouts yet.",
     )
+}
+
+/// Only http(s) links are rendered, so a hostile URL cannot run script.
+fn link(url: &str, text: &str) -> String {
+    if url.starts_with("https://") || url.starts_with("http://") {
+        format!(
+            "<a href=\"{}\" rel=\"noreferrer\">{}</a>",
+            escape(url),
+            escape(text)
+        )
+    } else {
+        escape(text)
+    }
+}
+
+fn releases_section(releases: &ReleasesView, csrf: &str) -> String {
+    let mut html = String::from("<section><h2>Releases</h2>");
+    if releases.lines.is_empty() {
+        html.push_str("<p>No release lines to show yet.</p>");
+    } else {
+        html.push_str(
+            "<div class=\"scroll\"><table><thead><tr><th>Line</th><th>Latest</th>\
+             <th>Status</th><th>Notes</th></tr></thead><tbody>",
+        );
+        for line in &releases.lines {
+            let status = match line.mark {
+                LineMark::Current => match &releases.current {
+                    Some(current) if *current < line.latest => {
+                        format!("cluster runs this line ({current})")
+                    }
+                    _ => "cluster runs this line".to_string(),
+                },
+                LineMark::Proposed => "proposed".to_string(),
+                LineMark::Step(step) => format!("step {step}"),
+            };
+            let _ = write!(
+                html,
+                "<tr><td>{}.{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                line.line.0,
+                line.line.1,
+                escape(&line.latest.to_string()),
+                escape(&status),
+                link(&line.notes_url, "release notes")
+            );
+        }
+        html.push_str("</tbody></table></div>");
+    }
+    let checked = match releases.fetched_age_secs {
+        Some(secs) if secs < 120 => "checked just now".to_string(),
+        Some(secs) => format!("checked {} min ago", secs / 60),
+        None => "not checked yet".to_string(),
+    };
+    let _ = write!(html, "<p>{}", escape(&checked));
+    if let Some(error) = &releases.last_error {
+        let _ = write!(html, "; last check failed: {}", escape(error));
+    }
+    html.push_str("</p>");
+    if releases.refresh_requested {
+        html.push_str("<p>A check is queued for the leader's next tick.</p>");
+    } else {
+        let _ = write!(
+            html,
+            "<form method=\"post\" action=\"/actions/check-releases\">{}\
+             <button type=\"submit\">Check now</button></form>",
+            csrf_field(csrf)
+        );
+    }
+    html.push_str("</section>");
+    html
 }
 
 fn nodes_section(nodes: &[NodeObservation]) -> String {
@@ -299,10 +372,7 @@ fn action_form(action: &AvailableAction, csrf: &str) -> String {
             let notes = if release_notes_url.starts_with("https://")
                 || release_notes_url.starts_with("http://")
             {
-                format!(
-                    "<p><a href=\"{}\" rel=\"noreferrer\">Release notes</a></p>",
-                    escape(release_notes_url)
-                )
+                format!("<p>{}</p>", link(release_notes_url, "Release notes"))
             } else {
                 String::new()
             };
@@ -472,6 +542,57 @@ mod tests {
         assert!(html.contains("action=\"/actions/decline\""));
         assert!(html.contains("name=\"rollout_id\" value=\"r-&lt;1&gt;\""));
         assert!(html.contains("Decline 26.1.8"));
+        assert_eq!(html.matches("name=\"csrf\" value=\"tok\"").count(), 2);
+    }
+
+    #[test]
+    fn releases_panel_marks_the_path_and_offers_a_check() {
+        use crate::releases::{LineMark, ReleaseLine, ReleasesView};
+        let mut view = ClusterView::sample();
+        assert!(
+            !dashboard(&view, &[], "tok", None).contains("Releases"),
+            "no catalog yet, no panel"
+        );
+        view.releases = Some(ReleasesView {
+            current: Some(Version::new(25, 4, 17)),
+            lines: vec![
+                ReleaseLine {
+                    line: (26, 2),
+                    latest: Version::new(26, 2, 7),
+                    mark: LineMark::Step(2),
+                    notes_url: "https://www.cockroachlabs.com/docs/releases/v26.2".to_string(),
+                },
+                ReleaseLine {
+                    line: (26, 1),
+                    latest: Version::new(26, 1, 8),
+                    mark: LineMark::Proposed,
+                    notes_url: "https://www.cockroachlabs.com/docs/releases/v26.1".to_string(),
+                },
+                ReleaseLine {
+                    line: (25, 4),
+                    latest: Version::new(25, 4, 17),
+                    mark: LineMark::Current,
+                    notes_url: "https://www.cockroachlabs.com/docs/releases/v25.4".to_string(),
+                },
+            ],
+            fetched_age_secs: Some(720),
+            refresh_requested: false,
+            last_error: Some("<rate limited>".to_string()),
+        });
+        let html = dashboard(&view, &[], "tok", None);
+        assert!(html.contains("<h2>Releases</h2>"));
+        for text in [
+            "26.2.7",
+            "step 2",
+            "proposed",
+            "cluster runs this line",
+            "checked 12 min ago",
+        ] {
+            assert!(html.contains(text), "{text} missing");
+        }
+        assert!(html.contains("href=\"https://www.cockroachlabs.com/docs/releases/v26.1\""));
+        assert!(html.contains("last check failed: &lt;rate limited&gt;"));
+        assert!(html.contains("action=\"/actions/check-releases\""));
         assert_eq!(html.matches("name=\"csrf\" value=\"tok\"").count(), 2);
     }
 }

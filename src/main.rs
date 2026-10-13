@@ -8,6 +8,7 @@ mod events;
 mod health;
 mod layout;
 mod ops;
+mod releases;
 mod rollout;
 mod web;
 
@@ -321,12 +322,6 @@ enum AppError {
     Postgres(#[from] postgres::Error),
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct GitHubRelease {
-    #[serde(alias = "name")]
-    tag_name: String,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct UpgradePlan {
     current_version: Version,
@@ -548,6 +543,7 @@ fn build_upgrade_plan(
 }
 
 /// Like `build_upgrade_plan`, but `None` when already on the target.
+/// Fetches the release list live; the daemon uses the cached catalog.
 fn next_upgrade_plan(
     cli: &Cli,
     current_version: Option<&str>,
@@ -557,19 +553,29 @@ fn next_upgrade_plan(
         Some(version) => parse_cockroach_version(version)?,
         None => installed_cockroach_version(&cockroach_binary(cli))?,
     };
-    let available_versions = available_cockroach_versions(&cli.github_api_url)?;
+    let target = target_version.map(parse_cockroach_version).transpose()?;
+    let versions = available_cockroach_versions(&cli.github_api_url)?;
+    plan_from_versions(cli, &current, target.as_ref(), versions)?
+        .map(with_release_notes)
+        .transpose()
+}
+
+/// The next release-line step from `current` toward `target` (default: the
+/// newest release), without the release-note scan. Cheap: no network.
+fn plan_from_versions(
+    cli: &Cli,
+    current: &Version,
+    target: Option<&Version>,
+    available_versions: Vec<Version>,
+) -> Result<Option<UpgradePlan>, AppError> {
     let latest = available_versions
         .iter()
         .max()
         .cloned()
         .ok_or_else(|| AppError::Message("no CockroachDB releases discovered".to_string()))?;
-    let target = match target_version {
-        Some(version) => parse_cockroach_version(version)?,
-        None => latest.clone(),
-    };
-
+    let target = target.cloned().unwrap_or_else(|| latest.clone());
     let upgrade_steps = build_upgrade_steps(
-        &current,
+        current,
         &target,
         &available_versions,
         &cli.release_notes_base_url,
@@ -577,20 +583,22 @@ fn next_upgrade_plan(
     let Some(next_step) = upgrade_steps.first().cloned() else {
         return Ok(None);
     };
-
-    let release_notes = fetch_text(&next_step.release_notes_url)?;
-    let warnings = scan_release_notes(&release_notes)?;
-
     Ok(Some(UpgradePlan {
-        current_version: current,
+        current_version: current.clone(),
         requested_target_version: target,
         next_version: next_step.to_version.clone(),
         latest_version: latest,
         release_notes_url: next_step.release_notes_url.clone(),
-        release_note_warnings: warnings,
+        release_note_warnings: Vec::new(),
         upgrade_steps,
         release_line_by_release_line: true,
     }))
+}
+
+fn with_release_notes(mut plan: UpgradePlan) -> Result<UpgradePlan, AppError> {
+    let release_notes = fetch_text(&plan.release_notes_url)?;
+    plan.release_note_warnings = scan_release_notes(&release_notes)?;
+    Ok(plan)
 }
 
 fn install_command(
@@ -769,10 +777,43 @@ fn db_daemon_tick(
             return follower_reconcile(cli, client, agent_id, false);
         }
         events::prune(cli, client)?;
+        refresh_catalog_if_due(cli, client)?;
     }
 
     leader_reconcile(cli, client, auto_finalize, dry_run)?;
     follower_reconcile(cli, client, agent_id, dry_run)
+}
+
+/// Fetches the release list when the cached one is due. A fetch failure is
+/// recorded on the catalog and never fails the tick: the old list stays.
+fn refresh_catalog_if_due(cli: &Cli, client: &mut Client) -> Result<(), AppError> {
+    let catalog = releases::load_catalog(cli, client)?;
+    let due = releases::refresh_due(
+        catalog
+            .as_ref()
+            .and_then(|catalog| catalog.fetched_age_secs),
+        catalog
+            .as_ref()
+            .and_then(|catalog| catalog.refresh_requested_age_secs),
+    );
+    if !due {
+        return Ok(());
+    }
+    match available_cockroach_versions(&cli.github_api_url) {
+        Ok(versions) => {
+            releases::store_catalog(cli, client, &versions)?;
+            audit(
+                cli,
+                "release_catalog_fetched",
+                &format!("versions={}", versions.len()),
+            )
+        }
+        Err(error) => {
+            let error = error.to_string();
+            releases::store_catalog_error(cli, client, &error)?;
+            audit(cli, "release_catalog_failed", &error)
+        }
+    }
 }
 
 fn leader_reconcile(
@@ -900,7 +941,12 @@ fn propose_next_rollout(
         Ok(span) => span,
         Err(reason) => return note_skip(cli, client, &reason),
     };
-    let Some(plan) = next_upgrade_plan(cli, Some(&oldest.to_string()), None)? else {
+    let Some(catalog) =
+        releases::load_catalog(cli, client)?.filter(|catalog| !catalog.versions.is_empty())
+    else {
+        return note_skip(cli, client, "the release catalog has not been fetched yet");
+    };
+    let Some(plan) = plan_from_versions(cli, &oldest, None, catalog.versions)? else {
         if newest != oldest {
             return note_skip(
                 cli,
@@ -932,6 +978,7 @@ fn propose_next_rollout(
             ),
         );
     }
+    let plan = with_release_notes(plan)?;
     let manifest = create_manifest_for_plan(cli, plan)?;
     publish_rollout(cli, client, &manifest)
 }
@@ -1711,6 +1758,15 @@ fn ensure_schema(cli: &Cli, client: &mut Client) -> Result<(), AppError> {
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 expires_at TIMESTAMPTZ NOT NULL,
                 client_ip STRING NOT NULL
+            )"
+        ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.release_catalog (
+                id INT8 PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                versions_json STRING NULL,
+                fetched_at TIMESTAMPTZ NULL,
+                refresh_requested_at TIMESTAMPTZ NULL,
+                last_error STRING NULL
             )"
         ),
         format!(
@@ -2495,56 +2551,22 @@ fn polkit_can_restart(service: &str) -> Result<String, String> {
 }
 
 fn available_cockroach_versions(github_api_url: &str) -> Result<Vec<Version>, AppError> {
-    let releases_url = github_tags_url(github_api_url);
-    let client = reqwest::blocking::Client::new();
-    let mut releases = Vec::new();
-    for page in 1..=10 {
-        let page_url = paginated_url(&releases_url, page);
-        let page_releases: Vec<GitHubRelease> = client
-            .get(page_url)
-            .header(reqwest::header::USER_AGENT, "cockroach-rollout-agent")
-            .send()?
-            .error_for_status()?
-            .json()?;
-        let page_len = page_releases.len();
-        releases.extend(page_releases);
-        if page_len < 100 {
-            break;
-        }
+    // One unpaginated call returns every `v*` tag; paging `/tags` needed ten
+    // calls and silently lost releases past the first thousand tags.
+    let url = releases::matching_refs_url(github_api_url).map_err(AppError::Message)?;
+    let body = reqwest::blocking::Client::new()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "cockroach-rollout-agent")
+        .send()?
+        .error_for_status()?
+        .text()?;
+    let versions = releases::parse_matching_refs(&body).map_err(AppError::Message)?;
+    if versions.is_empty() {
+        return Err(AppError::Message(
+            "GitHub listed no CockroachDB release tags".to_string(),
+        ));
     }
-
-    let mut versions = releases
-        .iter()
-        .filter_map(|release| parse_cockroach_version(&release.tag_name).ok())
-        .filter(|version| version.pre.is_empty())
-        .collect::<Vec<_>>();
-    versions.sort();
-    versions.dedup();
     Ok(versions)
-}
-
-fn github_tags_url(github_api_url: &str) -> String {
-    let base = github_api_url
-        .trim_end_matches('/')
-        .replace("/releases/latest", "/tags")
-        .replace("/releases", "/tags")
-        .trim_end_matches("/latest")
-        .to_string();
-    if base.contains('?') {
-        format!("{base}&per_page=100")
-    } else {
-        format!("{base}?per_page=100")
-    }
-}
-
-fn paginated_url(base: &str, page: u16) -> String {
-    if base.contains("page=") {
-        base.to_string()
-    } else if base.contains('?') {
-        format!("{base}&page={page}")
-    } else {
-        format!("{base}?page={page}")
-    }
 }
 
 /// The binary the agent reads the installed version from.

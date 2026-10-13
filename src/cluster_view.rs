@@ -12,7 +12,10 @@ use postgres::Client;
 use semver::Version;
 
 use crate::health::ClusterHealth;
-use crate::rollout::{AgentObservation, NodeObservation, RolloutKind, RolloutStatus, stale_after};
+use crate::releases::{self, ReleasesView};
+use crate::rollout::{
+    AgentObservation, NodeObservation, RolloutKind, RolloutStatus, live_version_span, stale_after,
+};
 use crate::{
     AppError, Cli, DEFAULT_DAEMON_INTERVAL_SECONDS, INSTALL_LEASE, LEADER_LEASE, OpenRollout,
     cluster_health, cluster_nodes, major_line, open_rollout, sql_ident,
@@ -31,6 +34,8 @@ pub struct ClusterView {
     pub health: Result<ClusterHealth, String>,
     pub events: Vec<EventRow>,
     pub stale_after_secs: u64,
+    /// `None` until the leader has stored a release catalog.
+    pub releases: Option<ReleasesView>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +192,35 @@ pub fn load(cli: &Cli, client: &mut Client) -> Result<ClusterView, AppError> {
         })
         .collect();
 
+    let releases = releases::load_catalog(cli, client)?.map(|catalog| {
+        let current = live_version_span(&nodes).ok().map(|(oldest, _)| oldest);
+        let proposed = open
+            .as_ref()
+            .filter(|open| open.kind == RolloutKind::Upgrade)
+            .map(|open| &open.to);
+        ReleasesView {
+            lines: current
+                .as_ref()
+                .map(|current| {
+                    releases::release_lines(
+                        current,
+                        &catalog.versions,
+                        proposed,
+                        &cli.release_notes_base_url,
+                    )
+                })
+                .unwrap_or_default(),
+            current,
+            fetched_age_secs: catalog.fetched_age_secs,
+            refresh_requested: catalog.refresh_requested_age_secs.is_some_and(|requested| {
+                catalog
+                    .fetched_age_secs
+                    .is_none_or(|fetched| requested < fetched)
+            }),
+            last_error: catalog.last_error,
+        }
+    });
+
     Ok(ClusterView {
         rollouts,
         open,
@@ -197,6 +231,7 @@ pub fn load(cli: &Cli, client: &mut Client) -> Result<ClusterView, AppError> {
         events,
         stale_after_secs: stale_after(Duration::from_secs(DEFAULT_DAEMON_INTERVAL_SECONDS))
             .as_secs(),
+        releases,
     })
 }
 
@@ -308,6 +343,7 @@ impl ClusterView {
             }),
             events: Vec::new(),
             stale_after_secs: 900,
+            releases: None,
         }
     }
 }
