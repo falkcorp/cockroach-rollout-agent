@@ -1,0 +1,25 @@
+# file: examples/cockroach-rollout-agent-ui-cert.service
+# version: 1.0.0
+# guid: 91439bba-1f26-45db-b30b-feee4da97866
+
+# Run daily by cockroach-rollout-agent-ui-cert.timer. Stages a new web UI
+# certificate when the approved one is close to expiry. It only acts on the
+# node holding the UI CA key (see ui-cert init-ca), and a person still has to
+# approve what it stages. Same sandbox as the agent.
+
+[Unit]
+Description=Stage a renewed cockroach-rollout-agent UI certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cockroach
+Group=cockroach
+EnvironmentFile=/etc/cockroach-rollout-agent.env
+ExecStart=/usr/local/bin/cockroach-rollout-agent ui-cert renew
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/cockroach-rollout-agent /var/lib/cockroach-rollout-agent

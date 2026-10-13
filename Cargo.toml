@@ -27,6 +27,7 @@ native-tls = "0.2"
 postgres = "0.19"
 postgres-native-tls = "0.5"
 rand = "0.10"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
 regex = "1.10"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 rpassword = "7"
@@ -38,11 +39,10 @@ sha2 = "0.10"
 subtle = "2.6"
 tempfile = "3.10"
 thiserror = "2.0"
+time = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tower-http = { version = "0.6", features = ["catch-panic"] }
-
-[dev-dependencies]
-rcgen = "0.14"
+x509-parser = "0.18"
 
 [profile.dev.package.argon2]
 opt-level = 3

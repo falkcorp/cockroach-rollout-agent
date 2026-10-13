@@ -11,12 +11,13 @@ mod ops;
 mod releases;
 mod rollout;
 mod settings;
+mod uicert;
 mod web;
 
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
@@ -58,6 +59,7 @@ const DEFAULT_RESTART_TIMEOUT_SECONDS: u64 = 600;
 const DEFAULT_UI_LISTEN: &str = "0.0.0.0:38090";
 const LEADER_LEASE: &str = "leader";
 const INSTALL_LEASE: &str = "install";
+const UI_CERT_RENEW_LEASE: &str = "ui_cert_renew";
 /// The install lease outlives a full download + restart + health wait, so a
 /// crashed holder blocks the next node for a bounded time instead of forever.
 const INSTALL_LEASE_EXTRA_SECONDS: u64 = 900;
@@ -276,6 +278,13 @@ enum Commands {
     /// password from stdin, prompting without echo on a terminal.
     SetUiPassword,
 
+    /// Manage the web UI's certificates: a name-constrained private CA on
+    /// one node, and leaf certificates staged for a person to approve.
+    UiCert {
+        #[command(subcommand)]
+        action: UiCertCommand,
+    },
+
     /// Show rollouts, cluster nodes, agents, and lease holders.
     Status,
 
@@ -298,6 +307,35 @@ enum Commands {
 
     /// Validate the binary layout, restart authorization, and SQL access.
     SelfCheck,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum UiCertCommand {
+    /// Create the Rollout UI CA on this node, constrained to every agent's
+    /// hostname and every node's IP. Refuses to replace an existing CA.
+    InitCa {
+        /// Another DNS name or IP the CA may sign for. Repeatable.
+        #[arg(long)]
+        extra_name: Vec<String>,
+    },
+    /// Stage a new leaf certificate when none is approved or the approved
+    /// one expires soon. Does nothing on nodes without the CA key.
+    Renew {
+        /// Renew when the approved certificate expires within this many days.
+        #[arg(long, default_value_t = uicert::RENEW_BEFORE_DAYS)]
+        before_days: i64,
+        /// Lifetime of the new certificate, in days.
+        #[arg(long, default_value_t = uicert::LEAF_DAYS)]
+        days: i64,
+    },
+    /// Stage a certificate and key from files for approval.
+    Stage { cert: PathBuf, key: PathBuf },
+    /// Approve the staged certificate; every agent then installs it.
+    Approve { fingerprint: String },
+    /// Reject the staged certificate.
+    Reject { fingerprint: String },
+    /// Show the approved and staged certificates.
+    Show,
 }
 
 #[derive(Debug, Error)]
@@ -450,6 +488,7 @@ fn run() -> Result<(), AppError> {
         Commands::Cancel { reason } => cancel_command(&cli, reason),
         Commands::RestartCluster => restart_cluster_command(&cli),
         Commands::SetUiPassword => set_ui_password_command(&cli),
+        Commands::UiCert { action } => ui_cert_command(&cli, action),
         Commands::Status => status_command(&cli),
         Commands::InitDb => init_db_command(&cli),
         Commands::Discover => discover_command(&cli),
@@ -735,9 +774,7 @@ fn db_daemon_command(
         ),
     )?;
     // Dry runs promise to write nothing, and UI actions write.
-    if !dry_run {
-        start_web_ui(cli)?;
-    }
+    let ui = if dry_run { None } else { start_web_ui(cli)? };
 
     let mut schema_ready = false;
     loop {
@@ -747,7 +784,14 @@ fn db_daemon_command(
                 ensure_schema(cli, &mut client)?;
                 schema_ready = true;
             }
-            db_daemon_tick(cli, &mut client, &agent_id, dry_run, auto_finalize)
+            db_daemon_tick(
+                cli,
+                &mut client,
+                &agent_id,
+                dry_run,
+                auto_finalize,
+                ui.as_deref(),
+            )
         })();
         if let Err(error) = result {
             audit(cli, "db_daemon_tick_failed", &error.to_string())?;
@@ -763,6 +807,7 @@ fn db_daemon_tick(
     agent_id: &str,
     dry_run: bool,
     auto_finalize: bool,
+    ui: Option<&web::UiServer>,
 ) -> Result<(), AppError> {
     let installed = installed_cockroach_version(&cockroach_binary(cli))?;
 
@@ -773,7 +818,16 @@ fn db_daemon_tick(
             holder.as_deref().unwrap_or("none")
         );
     } else {
-        heartbeat_agent(cli, client, agent_id, &installed)?;
+        if let Some(ui) = ui {
+            sync_ui_cert(cli, client, agent_id, ui)?;
+        }
+        heartbeat_agent(
+            cli,
+            client,
+            agent_id,
+            &installed,
+            ui.and_then(web::UiServer::served).as_deref(),
+        )?;
         let lease = acquire_lease(cli, client, LEADER_LEASE, agent_id, DEFAULT_LEASE_SECONDS)?;
         if !lease.is_leader {
             audit(
@@ -789,6 +843,114 @@ fn db_daemon_tick(
 
     leader_reconcile(cli, client, auto_finalize, dry_run)?;
     follower_reconcile(cli, client, agent_id, dry_run)
+}
+
+/// Installs the approved UI certificate when it is not the one being served.
+/// A certificate this node cannot use is reported on its agent row and the
+/// old one keeps serving; it never fails the tick.
+fn sync_ui_cert(
+    cli: &Cli,
+    client: &mut Client,
+    agent_id: &str,
+    ui: &web::UiServer,
+) -> Result<(), AppError> {
+    let Some(material) = uicert::material(cli, client, None, "approved")? else {
+        return Ok(());
+    };
+    if ui.served().as_deref() == Some(material.fingerprint.as_str()) {
+        return Ok(());
+    }
+    let result = install_ui_cert(cli, client, agent_id, &material, ui);
+    let schema = sql_ident(&cli.schema)?;
+    client.execute(
+        &format!("UPDATE {schema}.agent_status SET ui_cert_error = $2 WHERE agent_id = $1"),
+        &[&agent_id, &result.as_ref().err()],
+    )?;
+    if result.is_ok() {
+        events::note(
+            cli,
+            client,
+            Source::Agent,
+            "ui_cert_installed",
+            &format!("fingerprint={}", material.fingerprint),
+        )?;
+    }
+    Ok(())
+}
+
+fn install_ui_cert(
+    cli: &Cli,
+    client: &mut Client,
+    agent_id: &str,
+    material: &uicert::Material,
+    ui: &web::UiServer,
+) -> Result<(), String> {
+    let now = unix_time().map_err(|error| error.to_string())? as i64;
+    let info = uicert::validate(
+        &material.pem.cert,
+        &material.pem.key,
+        &material.chain_pem,
+        now,
+    )?;
+    let hostname = agent_id.split(':').next().unwrap_or(agent_id);
+    let ips = own_gossip_ips(client).map_err(|error| error.to_string())?;
+    if !uicert::covers(&info, hostname, &ips) {
+        return Err(format!(
+            "this node ({hostname}, {}) is not among the certificate's names ({})",
+            ips.iter()
+                .map(IpAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            info.hosts().describe()
+        ));
+    }
+    write_ui_cert_files(&managed_ui_certs_dir(cli), &material.pem)
+        .map_err(|error| format!("cannot write the certificate: {error}"))?;
+    ui.install(&material.pem.cert, &material.pem.key, &material.fingerprint)
+}
+
+/// This node's address as other nodes see it, when it is an IP.
+fn own_gossip_ips(client: &mut Client) -> Result<Vec<IpAddr>, AppError> {
+    let row = client.query_one(
+        "SELECT address FROM crdb_internal.gossip_nodes WHERE node_id = crdb_internal.node_id()",
+        &[],
+    )?;
+    let address: String = row.get(0);
+    Ok(uicert::hosts_from(&[], &[address], &[]).ips)
+}
+
+/// The agent-owned directory approved UI certificates are written to.
+fn managed_ui_certs_dir(cli: &Cli) -> PathBuf {
+    cli.agent_root.join("ui-certs")
+}
+
+fn ui_ca_dir(cli: &Cli) -> PathBuf {
+    cli.agent_root.join("ui-ca")
+}
+
+/// Writes `node.crt` and `node.key` by rename, keeping the previous pair as
+/// `*.prev`, so a crash never leaves a half-written certificate.
+fn write_ui_cert_files(dir: &Path, pem: &uicert::Pem) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    for (name, contents) in [("node.crt", &pem.cert), ("node.key", &pem.key)] {
+        let path = dir.join(name);
+        if path.exists() {
+            fs::copy(&path, dir.join(format!("{name}.prev")))?;
+        }
+        let tmp = dir.join(format!(".{name}.tmp"));
+        let _ = fs::remove_file(&tmp);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp, &path)?;
+    }
+    Ok(())
 }
 
 /// Fetches the release list when the cached one is due. A fetch failure is
@@ -1821,6 +1983,27 @@ fn ensure_schema(cli: &Cli, client: &mut Client) -> Result<(), AppError> {
             )"
         ),
         format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.ui_certs (
+                fingerprint STRING PRIMARY KEY,
+                cert_pem STRING NOT NULL,
+                key_pem STRING NOT NULL,
+                chain_pem STRING NOT NULL,
+                status STRING NOT NULL,
+                not_before INT8 NOT NULL,
+                not_after INT8 NOT NULL,
+                created_by STRING NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                decided_by STRING NULL,
+                decided_at TIMESTAMPTZ NULL
+            )"
+        ),
+        format!(
+            "ALTER TABLE {schema}.agent_status ADD COLUMN IF NOT EXISTS ui_cert_fingerprint STRING NULL"
+        ),
+        format!(
+            "ALTER TABLE {schema}.agent_status ADD COLUMN IF NOT EXISTS ui_cert_error STRING NULL"
+        ),
+        format!(
             "CREATE TABLE IF NOT EXISTS {schema}.release_catalog (
                 id INT8 PRIMARY KEY DEFAULT 1 CHECK (id = 1),
                 versions_json STRING NULL,
@@ -2105,22 +2288,30 @@ fn heartbeat_agent(
     client: &mut Client,
     agent_id: &str,
     version: &Version,
+    ui_cert_fingerprint: Option<&str>,
 ) -> Result<(), AppError> {
     let schema = sql_ident(&cli.schema)?;
     client.execute(
         &format!(
             "
             INSERT INTO {schema}.agent_status
-                (agent_id, state, version, updated_at, last_seen, node_id, agent_version)
-            VALUES ($1, 'idle', $2, now(), now(), crdb_internal.node_id(), $3)
+                (agent_id, state, version, updated_at, last_seen, node_id, agent_version,
+                 ui_cert_fingerprint)
+            VALUES ($1, 'idle', $2, now(), now(), crdb_internal.node_id(), $3, $4)
             ON CONFLICT (agent_id) DO UPDATE
             SET version = excluded.version,
                 last_seen = now(),
                 node_id = excluded.node_id,
-                agent_version = excluded.agent_version
+                agent_version = excluded.agent_version,
+                ui_cert_fingerprint = excluded.ui_cert_fingerprint
             "
         ),
-        &[&agent_id, &version.to_string(), &env!("CARGO_PKG_VERSION")],
+        &[
+            &agent_id,
+            &version.to_string(),
+            &env!("CARGO_PKG_VERSION"),
+            &ui_cert_fingerprint,
+        ],
     )?;
     Ok(())
 }
@@ -2507,8 +2698,8 @@ fn ui_listen_addr(value: &str) -> Result<Option<SocketAddr>, String> {
 
 /// The UI's certs dir and TLS config, the same resolution `self-check` reports.
 fn ui_tls(cli: &Cli) -> Result<(PathBuf, rustls::ServerConfig), String> {
-    let dir = match &cli.ui_certs_dir {
-        Some(dir) => dir.clone(),
+    let dir = match pick_ui_certs_dir(cli.ui_certs_dir.as_deref(), &managed_ui_certs_dir(cli)) {
+        Some(dir) => dir,
         None => web::tls::resolve_certs_dir(
             None,
             service_name(cli).map_err(|error| error.to_string())?,
@@ -2518,36 +2709,237 @@ fn ui_tls(cli: &Cli) -> Result<(PathBuf, rustls::ServerConfig), String> {
     Ok((dir, config))
 }
 
+/// The override, else an approved certificate the agent installed, else
+/// `None`: fall back to the CockroachDB node certificate.
+fn pick_ui_certs_dir(override_dir: Option<&Path>, managed: &Path) -> Option<PathBuf> {
+    override_dir.map(Path::to_path_buf).or_else(|| {
+        managed
+            .join("node.crt")
+            .is_file()
+            .then(|| managed.to_path_buf())
+    })
+}
+
 /// Starts the UI thread. Every failure leaves the UI off and the daemon
 /// running: rollouts never depend on the UI, and it never falls back to HTTP.
-fn start_web_ui(cli: &Cli) -> Result<(), AppError> {
+fn start_web_ui(cli: &Cli) -> Result<Option<Arc<web::UiServer>>, AppError> {
+    let disabled = |reason: &str| -> Result<Option<Arc<web::UiServer>>, AppError> {
+        eprintln!("ui disabled: {reason}");
+        audit(cli, "ui_disabled", reason)?;
+        Ok(None)
+    };
     let listen = match ui_listen_addr(&cli.ui_listen) {
         Ok(Some(listen)) => listen,
-        Ok(None) => return audit(cli, "ui_disabled", "CROACH_ROLLOUT_UI_LISTEN=off"),
-        Err(reason) => {
-            eprintln!("ui disabled: {reason}");
-            return audit(cli, "ui_disabled", &reason);
+        Ok(None) => {
+            audit(cli, "ui_disabled", "CROACH_ROLLOUT_UI_LISTEN=off")?;
+            return Ok(None);
         }
+        Err(reason) => return disabled(&reason),
     };
-    let tls = match ui_tls(cli) {
-        Ok((_, config)) => config,
-        Err(reason) => {
-            eprintln!("ui disabled: {reason}");
-            return audit(cli, "ui_disabled", &reason);
-        }
+    let (dir, tls) = match ui_tls(cli) {
+        Ok(found) => found,
+        Err(reason) => return disabled(&reason),
     };
+    let served = fs::read_to_string(dir.join("node.crt"))
+        .ok()
+        .and_then(|pem| uicert::inspect(&pem).ok())
+        .map(|info| info.fingerprint);
+    let server = Arc::new(web::UiServer::new(tls, served));
     let state = web::routes::AppState::new(
         Arc::new(web::db::DbBackend::new(cli.clone())),
         Duration::from_secs(cli.ui_session_hours.saturating_mul(3600)),
     );
-    match web::spawn(listen, state, tls) {
-        Ok(_) => audit(cli, "ui_started", &format!("listen={listen}")),
-        Err(error) => {
-            let reason = format!("cannot listen on {listen}: {error}");
-            eprintln!("ui disabled: {reason}");
-            audit(cli, "ui_disabled", &reason)
+    match web::spawn(listen, state, server.clone()) {
+        Ok(_) => {
+            audit(
+                cli,
+                "ui_started",
+                &format!("listen={listen} certs={}", dir.display()),
+            )?;
+            Ok(Some(server))
+        }
+        Err(error) => disabled(&format!("cannot listen on {listen}: {error}")),
+    }
+}
+
+fn ui_cert_command(cli: &Cli, action: &UiCertCommand) -> Result<(), AppError> {
+    let mut client = db_client(cli)?;
+    ensure_schema(cli, &mut client)?;
+    let client = &mut client;
+    let now = unix_time()? as i64;
+    let by = Actor::Cli.label(cli);
+    match action {
+        UiCertCommand::InitCa { extra_name } => {
+            let dir = ui_ca_dir(cli);
+            if dir.join("ca.key").exists() {
+                return Err(AppError::Message(format!(
+                    "{} already holds a UI CA; remove it by hand to start over",
+                    dir.display()
+                )));
+            }
+            let agent_ids: Vec<String> = cluster_view::agent_rows(cli, client)?
+                .into_iter()
+                .map(|row| row.observation.agent_id)
+                .collect();
+            let addresses: Vec<String> = discover_nodes(client)?
+                .into_iter()
+                .map(|node| node.address)
+                .collect();
+            let hosts = uicert::hosts_from(&agent_ids, &addresses, extra_name);
+            let ca = uicert::generate_ca(&hosts, time::OffsetDateTime::now_utc())
+                .map_err(AppError::Message)?;
+            write_private_files(&dir, &[("ca.crt", &ca.cert), ("ca.key", &ca.key)])?;
+            let info = uicert::inspect(&ca.cert).map_err(AppError::Message)?;
+            events::note(
+                cli,
+                client,
+                Source::Cli,
+                "ui_ca_created",
+                &format!(
+                    "fingerprint={} hosts={} by={by}",
+                    info.fingerprint,
+                    hosts.describe()
+                ),
+            )?;
+            println!(
+                "created the Rollout UI CA in {}\n  may sign for: {}\n  sha256: {}\n\
+                 next: cockroach-rollout-agent ui-cert renew",
+                dir.display(),
+                hosts.describe(),
+                info.fingerprint
+            );
+        }
+        UiCertCommand::Renew { before_days, days } => {
+            let dir = ui_ca_dir(cli);
+            let (Ok(cert), Ok(key)) = (
+                fs::read_to_string(dir.join("ca.crt")),
+                fs::read_to_string(dir.join("ca.key")),
+            ) else {
+                println!(
+                    "no UI CA key in {}; nothing to do on this node",
+                    dir.display()
+                );
+                return Ok(());
+            };
+            let holder = agent_node_id(cli)?;
+            let lease = acquire_lease(cli, client, UI_CERT_RENEW_LEASE, &holder, 300)?;
+            if !lease.is_leader {
+                println!("{} is renewing; nothing to do", lease.holder_id);
+                return Ok(());
+            }
+            if let Some(staged) = uicert::material(cli, client, None, "staged")? {
+                println!(
+                    "certificate {} is staged and waiting for approval; nothing to do",
+                    staged.fingerprint
+                );
+                return Ok(());
+            }
+            if let Some(approved) = uicert::material(cli, client, None, "approved")? {
+                let info = uicert::inspect(&approved.pem.cert).map_err(AppError::Message)?;
+                if !uicert::renew_due(info.not_after, now, *before_days) {
+                    println!(
+                        "the approved certificate is good for {} more days; nothing to do",
+                        (info.not_after - now) / 86_400
+                    );
+                    return Ok(());
+                }
+            }
+            let ca = uicert::Pem { cert, key };
+            let hosts = uicert::ca_hosts(&ca.cert).map_err(AppError::Message)?;
+            let leaf = uicert::issue_leaf(&ca, &hosts, time::OffsetDateTime::now_utc(), *days)
+                .map_err(AppError::Message)?;
+            let info = uicert::stage(cli, client, &leaf, &ca.cert, &holder, now)?;
+            events::note(
+                cli,
+                client,
+                Source::Cli,
+                "ui_cert_staged",
+                &format!("fingerprint={} by={holder}", info.fingerprint),
+            )?;
+            println!(
+                "staged certificate {} for {}; approve it in the UI or with: \
+                 cockroach-rollout-agent ui-cert approve {}",
+                info.fingerprint,
+                info.hosts().describe(),
+                info.fingerprint
+            );
+        }
+        UiCertCommand::Stage { cert, key } => {
+            let pem = uicert::Pem {
+                cert: fs::read_to_string(cert)?,
+                key: fs::read_to_string(key)?,
+            };
+            let chain = ui_ca_for_staging(cli, client)?;
+            let info = uicert::stage(cli, client, &pem, &chain, &by, now)?;
+            events::note(
+                cli,
+                client,
+                Source::Cli,
+                "ui_cert_uploaded",
+                &format!("fingerprint={} by={by}", info.fingerprint),
+            )?;
+            println!("staged certificate {}", info.fingerprint);
+        }
+        UiCertCommand::Approve { fingerprint } | UiCertCommand::Reject { fingerprint } => {
+            let approve = matches!(action, UiCertCommand::Approve { .. });
+            println!(
+                "{}",
+                ops::decide_ui_cert(cli, client, &Actor::Cli, fingerprint, approve)?
+            );
+        }
+        UiCertCommand::Show => {
+            let rows = uicert::rows(cli, client)?;
+            if rows.is_empty() {
+                println!("no UI certificate is approved or staged");
+            }
+            for row in rows {
+                println!(
+                    "{} {}\n  names: {}\n  valid until: {}\n  staged by {} at {}",
+                    row.status,
+                    row.info.fingerprint,
+                    row.info.hosts().describe(),
+                    row.info.not_after,
+                    row.created_by,
+                    row.created_at
+                );
+            }
         }
     }
+    Ok(())
+}
+
+/// The CA an uploaded certificate must chain to: this node's, else the one
+/// the approved certificate chains to.
+fn ui_ca_for_staging(cli: &Cli, client: &mut Client) -> Result<String, AppError> {
+    if let Ok(cert) = fs::read_to_string(ui_ca_dir(cli).join("ca.crt")) {
+        return Ok(cert);
+    }
+    uicert::material(cli, client, None, "approved")?
+        .map(|material| material.chain_pem)
+        .ok_or_else(|| {
+            AppError::Message(
+                "no UI CA is known yet: run ui-cert init-ca on one node first".to_string(),
+            )
+        })
+}
+
+/// Creates `dir` (0700) and each file (0600), refusing to overwrite.
+fn write_private_files(dir: &Path, files: &[(&str, &String)]) -> Result<(), AppError> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    for (name, contents) in files {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(name))?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
+    Ok(())
 }
 
 fn set_ui_password_command(cli: &Cli) -> Result<(), AppError> {
@@ -3081,6 +3473,56 @@ fn unix_time() -> Result<u64, AppError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_tls_prefers_an_installed_certificate_over_the_node_certificate() {
+        let managed = tempfile::tempdir().unwrap();
+        assert_eq!(
+            pick_ui_certs_dir(None, managed.path()),
+            None,
+            "nothing installed: fall back to the CockroachDB unit's certs"
+        );
+        fs::write(managed.path().join("node.crt"), "x").unwrap();
+        assert_eq!(
+            pick_ui_certs_dir(None, managed.path()),
+            Some(managed.path().to_path_buf())
+        );
+        assert_eq!(
+            pick_ui_certs_dir(Some(Path::new("/etc/ui")), managed.path()),
+            Some(PathBuf::from("/etc/ui")),
+            "an explicit override always wins"
+        );
+    }
+
+    #[test]
+    fn ui_cert_files_are_replaced_atomically_keeping_the_previous_pair() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("ui-certs");
+        let first = uicert::Pem {
+            cert: "cert one".to_string(),
+            key: "key one".to_string(),
+        };
+        write_ui_cert_files(&target, &first).unwrap();
+        let second = uicert::Pem {
+            cert: "cert two".to_string(),
+            key: "key two".to_string(),
+        };
+        write_ui_cert_files(&target, &second).unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("node.crt")).unwrap(),
+            "cert two"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("node.key.prev")).unwrap(),
+            "key one"
+        );
+        let mode = fs::metadata(target.join("node.key"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
     #[test]
     fn only_an_unknown_variable_is_ignored_when_allowing_internals() {
         assert!(unknown_session_variable(
