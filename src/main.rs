@@ -2729,7 +2729,11 @@ fn choose_ui_tls(
     if managed.join("node.crt").is_file() {
         match web::tls::load_server_config(managed) {
             Ok(config) => return Ok((managed.to_path_buf(), config, true)),
-            Err(reason) => eprintln!("ui: ignoring the installed certificate: {reason}"),
+            // The approved certificate is installed again on the next tick,
+            // and any failure then is shown on the dashboard.
+            Err(_) => {
+                eprintln!("ui: the installed UI certificate does not load; using the fallback")
+            }
         }
     }
     let dir = fallback()?;
@@ -2913,9 +2917,14 @@ fn ui_cert_command(cli: &Cli, action: &UiCertCommand) -> Result<(), AppError> {
         }
         UiCertCommand::Approve { fingerprint } | UiCertCommand::Reject { fingerprint } => {
             let approve = matches!(action, UiCertCommand::Approve { .. });
+            ops::decide_ui_cert(cli, client, &Actor::Cli, fingerprint, approve)?;
             println!(
                 "{}",
-                ops::decide_ui_cert(cli, client, &Actor::Cli, fingerprint, approve)?
+                if approve {
+                    "approved; every agent installs it on its next tick"
+                } else {
+                    "rejected"
+                }
             );
         }
         UiCertCommand::Show => {
