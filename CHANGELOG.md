@@ -8,6 +8,15 @@ and this project adheres to
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-v0.3.1'></a>
+## v0.3.1 — 2026-10-13
+
+### Fixed
+
+- A freshly updated agent that cannot reach its node or the network keeps
+  waiting instead of being rolled back after 10 minutes. Only failures that
+  reach the database count towards the confirm deadline.
+
 <a id='changelog-v0.3.0'></a>
 ## v0.3.0 — 2026-10-13
 
