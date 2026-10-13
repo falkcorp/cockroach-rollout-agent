@@ -321,10 +321,20 @@ each architecture's SHA-256 taken from the release's `SHA256SUMS`.
      decline something else.
 
 Converting a host to the agent layout takes one more run of
-`install-rollout-agent.sh` (v0.3.0 or later), as root. After that, updates
-need neither ssh nor sudo. A host that still runs
-`/usr/local/bin/cockroach-rollout-agent` from its unit shows why in the
-panel and is skipped. It does not block the others.
+`install-rollout-agent.sh --enable` (v0.3.0 or later), as root. It restarts
+the agent onto the new unit. After that, updates need neither ssh nor sudo.
+
+- **Unconverted hosts:** an agent older than 0.3.0, or one not running from
+  the agent layout, is marked in the panel and skipped. It does not block
+  the others.
+- **The leader:** only the leader proposes, so it must run 0.3.0 or later.
+  The panel says so when it does not.
+- **Stuck claims:** a claim from an agent silent for an hour stops holding
+  the others back. `agent-update retry` clears failed claims, and claims of
+  agents that have stopped reporting.
+- **UI certificate renewal:** the `cockroach-rollout-agent-ui-cert` timer
+  also runs the agent link, so a just-swapped, not yet confirmed build can
+  run it once. It is a oneshot running as `cockroach`.
 
 `/usr/local/bin/cockroach-rollout-agent` is not updated and lags the agents.
 For operator commands, prefer the agent's own copy, still as `cockroach`:

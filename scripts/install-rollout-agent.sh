@@ -146,7 +146,8 @@ stage_current_binary() {
 # Copies the installed agent into the agent's own layout and points the link
 # the units run at it. Unlike bin/cockroach, an existing link is replaced:
 # running this script means "run this agent binary". A pending self-update is
-# dropped so agent-preflight cannot roll back to something older.
+# dropped so agent-preflight cannot roll back to something older. A rollback
+# note is kept: the agent still has to record that failure.
 stage_agent_binary() {
     local version name staged
     version=$("$AGENT_BINARY" --version | awk '{print $NF}')
@@ -160,7 +161,7 @@ stage_agent_binary() {
     as_agent mv -f "${AGENT_SELF_DIR}/versions/.${name}.partial" "$staged"
     [[ $(as_agent "$staged" --version | awk '{print $NF}') == "$version" ]] ||
         die "staged copy $staged does not report $version"
-    as_agent rm -f "${AGENT_SELF_DIR}/pending.json" "${AGENT_SELF_DIR}/rolled-back"
+    as_agent rm -f "${AGENT_SELF_DIR}/pending.json"
     as_agent ln -sfn "../versions/${name}" "${AGENT_SELF_DIR}/bin/.cockroach-rollout-agent.next"
     as_agent mv -Tf "${AGENT_SELF_DIR}/bin/.cockroach-rollout-agent.next" "$AGENT_SELF_LINK"
     log "$AGENT_SELF_LINK -> ../versions/${name}"
@@ -329,6 +330,8 @@ fi
 
 if $enable; then
     systemctl enable --now cockroach-rollout-agent.service
+    # enable --now leaves a running agent on its old binary and old unit.
+    systemctl try-restart cockroach-rollout-agent.service
     # Harmless on nodes without the UI CA key: renew exits without acting.
     systemctl enable --now cockroach-rollout-agent-ui-cert.timer
     log "agent enabled and started"

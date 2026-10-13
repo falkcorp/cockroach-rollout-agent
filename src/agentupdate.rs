@@ -1,5 +1,5 @@
 // file: src/agentupdate.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: e71c32fe-ae0a-49fb-9de9-6333f4abfd23
 // last-edited: 2026-10-13
 
@@ -34,6 +34,14 @@ pub const ROLLBACK_AFTER_STARTS: u32 = 2;
 /// How long a freshly updated agent may take to finish its first good tick
 /// before it exits, so the next start counts towards the rollback.
 pub const CONFIRM_DEADLINE_SECS: u64 = 600;
+/// A claim from an agent unheard of for this long stops holding the others
+/// back: its host is gone. Longer than a failed update takes to roll back
+/// (two confirm deadlines), so a rollback in progress still blocks.
+pub const CLAIM_STALE_SECS: i64 = 3600;
+/// Agent tarballs are a few MiB; anything bigger is not ours.
+pub const MAX_TARBALL_BYTES: u64 = 256 * 1024 * 1024;
+/// The first agent version that can update itself.
+pub const MIN_SELF_UPDATE_VERSION: Version = Version::new(0, 3, 0);
 
 const PENDING_FILE: &str = "pending.json";
 const ROLLED_BACK_FILE: &str = "rolled-back";
@@ -195,7 +203,7 @@ pub enum UpdateStep {
 
 /// Decides what this agent does about its own binary this tick.
 ///
-/// `in_flight` lists the other agents whose markers point at `approved`;
+/// `in_flight` lists the other live agents holding a claim, for any version;
 /// one of them updating, or failing to, holds everyone else back.
 pub fn update_step(
     own: &Version,
@@ -233,7 +241,16 @@ pub fn update_step(
 }
 
 /// One line on where an agent's self-update stands, for the CLI and UI.
-pub fn progress(to: Option<&str>, error: Option<&str>) -> String {
+pub fn progress(agent_version: Option<&str>, to: Option<&str>, error: Option<&str>) -> String {
+    let too_old = agent_version
+        .and_then(|version| Version::parse(version).ok())
+        .is_some_and(|version| version < MIN_SELF_UPDATE_VERSION);
+    if too_old {
+        return format!(
+            "cannot update itself before {MIN_SELF_UPDATE_VERSION}; \
+             rerun install-rollout-agent.sh"
+        );
+    }
     match (to, error) {
         (Some(to), Some(error)) => format!("update to {to} failed: {error}"),
         (Some(to), None) => format!("updating to {to}"),
@@ -243,12 +260,17 @@ pub fn progress(to: Option<&str>, error: Option<&str>) -> String {
 }
 
 /// Recorded before the agent restarts into a new binary.
+///
+/// Read by `agent-preflight` from the root-owned binary, which can be older
+/// than the agent that wrote the file. Only ever add fields, with a serde
+/// default, or older preflights stop protecting newer updates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {
     /// File name under `versions/` that ran before the swap.
     pub from: String,
     pub to: Version,
     /// Starts of the new binary so far, counted by `agent-preflight`.
+    #[serde(default)]
     pub starts: u32,
 }
 
@@ -325,17 +347,19 @@ pub fn preflight(layout: &BinaryLayout) -> io::Result<Preflight> {
     Ok(Preflight::RolledBack { message })
 }
 
-/// Takes the note `preflight` left after a rollback, if any.
-pub fn take_rolled_back(layout: &BinaryLayout) -> io::Result<Option<String>> {
-    let path = rolled_back_path(layout);
-    match fs::read_to_string(&path) {
-        Ok(message) => {
-            remove_file_if_present(&path)?;
-            Ok(Some(message))
-        }
+/// The note `preflight` left after a rollback, if any. It stays on disk
+/// until `clear_rolled_back`, after the failure is recorded in the DB, so a
+/// restart before then cannot lose it and let the bad version retry.
+pub fn read_rolled_back(layout: &BinaryLayout) -> io::Result<Option<String>> {
+    match fs::read_to_string(rolled_back_path(layout)) {
+        Ok(message) => Ok(Some(message)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+pub fn clear_rolled_back(layout: &BinaryLayout) -> io::Result<()> {
+    remove_file_if_present(&rolled_back_path(layout))
 }
 
 /// An agent release in the coordination DB, as operators see it.
@@ -395,19 +419,33 @@ pub fn rows(cli: &Cli, client: &mut Client) -> Result<Vec<AgentReleaseRow>, AppE
             &[],
         )?
         .iter()
-        .map(|row| {
+        // A malformed row is skipped rather than failing every agent's tick.
+        .filter_map(|row| {
             let version: String = row.get(0);
             let assets: String = row.get(3);
-            Ok(AgentReleaseRow {
-                version: Version::parse(&version)?,
-                status: row.get(1),
-                html_url: row.get(2),
-                assets: serde_json::from_str(&assets)?,
-                proposed_at: row.get(4),
-                decided_by: row.get(5),
-            })
+            let parsed = Version::parse(&version)
+                .map_err(|error| error.to_string())
+                .and_then(|version| {
+                    serde_json::from_str(&assets)
+                        .map(|assets| (version, assets))
+                        .map_err(|error| error.to_string())
+                });
+            match parsed {
+                Ok((version, assets)) => Some(AgentReleaseRow {
+                    version,
+                    status: row.get(1),
+                    html_url: row.get(2),
+                    assets,
+                    proposed_at: row.get(4),
+                    decided_by: row.get(5),
+                }),
+                Err(error) => {
+                    eprintln!("skipping malformed agent release {version}: {error}");
+                    None
+                }
+            }
         })
-        .collect::<Result<Vec<_>, AppError>>()?;
+        .collect::<Vec<_>>();
     rows.sort_by(|a, b| b.version.cmp(&a.version));
     Ok(rows)
 }
@@ -466,51 +504,70 @@ pub fn known_versions(cli: &Cli, client: &mut Client) -> Result<Vec<Version>, Ap
         .collect())
 }
 
-/// This agent's update claim, if it has one.
-pub fn marker(cli: &Cli, client: &mut Client, agent_id: &str) -> Result<Option<Marker>, AppError> {
+/// This agent's update claim, if it has one, and the raw error column,
+/// which without a claim holds a note.
+pub fn claim_state(
+    cli: &Cli,
+    client: &mut Client,
+    agent_id: &str,
+) -> Result<(Option<Marker>, Option<String>), AppError> {
     let schema = sql_ident(&cli.schema)?;
     let rows = client.query(
         &format!(
             "SELECT agent_update_to, agent_update_error FROM {schema}.agent_status \
-             WHERE agent_id = $1 AND agent_update_to IS NOT NULL"
+             WHERE agent_id = $1"
         ),
         &[&agent_id],
     )?;
-    rows.first()
-        .map(|row| {
-            let to: String = row.get(0);
-            Ok(Marker {
+    let Some(row) = rows.first() else {
+        return Ok((None, None));
+    };
+    let to: Option<String> = row.get(0);
+    let error: Option<String> = row.get(1);
+    let marker = to
+        .map(|to| {
+            Ok::<_, AppError>(Marker {
                 to: Version::parse(&to)?,
-                error: row.get(1),
+                error: error.clone(),
             })
         })
-        .transpose()
+        .transpose()?;
+    Ok((marker, error))
 }
 
-/// Other agents whose claims point at `target`: updating, or stuck.
-pub fn in_flight(
-    cli: &Cli,
-    client: &mut Client,
-    agent_id: &str,
-    target: &Version,
-) -> Result<Vec<String>, AppError> {
+/// A claim by an agent heard from within `CLAIM_STALE_SECS`, for any
+/// version: one agent updates at a time, even across successive approvals.
+fn live_claim() -> String {
+    format!(
+        "agent_id != $1 AND agent_update_to IS NOT NULL \
+         AND coalesce(last_seen, updated_at) > now() - INTERVAL '{CLAIM_STALE_SECS} seconds'"
+    )
+}
+
+/// Other live agents holding a claim: updating, or stuck after a failure.
+pub fn in_flight(cli: &Cli, client: &mut Client, agent_id: &str) -> Result<Vec<String>, AppError> {
     let schema = sql_ident(&cli.schema)?;
     Ok(client
         .query(
             &format!(
-                "SELECT agent_id FROM {schema}.agent_status \
-                 WHERE agent_id != $1 AND agent_update_to = $2 ORDER BY agent_id"
+                "SELECT agent_id, agent_update_to FROM {schema}.agent_status \
+                 WHERE {} ORDER BY agent_id",
+                live_claim()
             ),
-            &[&agent_id, &target.to_string()],
+            &[&agent_id],
         )?
         .iter()
-        .map(|row| row.get(0))
+        .map(|row| {
+            let agent: String = row.get(0);
+            let to: String = row.get(1);
+            format!("{agent} (to {to})")
+        })
         .collect())
 }
 
-/// Claims the update to `target` for this agent unless another agent holds
-/// a claim on it. One statement, so two agents cannot both win: CockroachDB
-/// runs it serializably.
+/// Claims the update to `target` for this agent unless another live agent
+/// holds any claim. Explicitly serializable, so two agents cannot both win
+/// even if the role defaults to a weaker isolation level.
 pub fn claim(
     cli: &Cli,
     client: &mut Client,
@@ -518,16 +575,21 @@ pub fn claim(
     target: &Version,
 ) -> Result<bool, AppError> {
     let schema = sql_ident(&cli.schema)?;
-    let changed = client.execute(
+    let mut tx = client
+        .build_transaction()
+        .isolation_level(postgres::IsolationLevel::Serializable)
+        .start()?;
+    let changed = tx.execute(
         &format!(
             "UPDATE {schema}.agent_status \
              SET agent_update_to = $2, agent_update_error = NULL \
              WHERE agent_id = $1 AND NOT EXISTS ( \
-                 SELECT 1 FROM {schema}.agent_status \
-                 WHERE agent_id != $1 AND agent_update_to = $2)"
+                 SELECT 1 FROM {schema}.agent_status WHERE {})",
+            live_claim()
         ),
         &[&agent_id, &target.to_string()],
     )?;
+    tx.commit()?;
     Ok(changed == 1)
 }
 
@@ -559,16 +621,18 @@ pub fn clear_marker(cli: &Cli, client: &mut Client, agent_id: &str) -> Result<()
     Ok(())
 }
 
-/// Drops every failed claim so those agents try again. Returns how many.
-pub fn retry(cli: &Cli, client: &mut Client) -> Result<u64, AppError> {
+/// Drops every failed claim, and every claim of an agent not heard from in
+/// `stale_after_secs`, so the rest can go on. Returns how many.
+pub fn retry(cli: &Cli, client: &mut Client, stale_after_secs: u64) -> Result<u64, AppError> {
     let schema = sql_ident(&cli.schema)?;
     Ok(client.execute(
         &format!(
             "UPDATE {schema}.agent_status \
              SET agent_update_to = NULL, agent_update_error = NULL \
-             WHERE agent_update_to IS NOT NULL AND agent_update_error IS NOT NULL"
+             WHERE agent_update_to IS NOT NULL AND (agent_update_error IS NOT NULL \
+                OR coalesce(last_seen, updated_at) < now() - $1::INT8 * INTERVAL '1 second')"
         ),
-        &[],
+        &[&(stale_after_secs as i64)],
     )?)
 }
 
@@ -772,10 +836,34 @@ mod tests {
         ));
         assert_eq!(fs::read_to_string(layout.current_link()).unwrap(), "0.3.0");
         assert_eq!(read_pending(&layout).unwrap(), None);
-        let note = take_rolled_back(&layout).unwrap().unwrap();
+        let note = read_rolled_back(&layout).unwrap().unwrap();
         assert!(note.contains("0.3.1"));
-        assert_eq!(take_rolled_back(&layout).unwrap(), None);
+        assert_eq!(
+            read_rolled_back(&layout).unwrap(),
+            Some(note),
+            "kept until reported"
+        );
+        clear_rolled_back(&layout).unwrap();
+        assert_eq!(read_rolled_back(&layout).unwrap(), None);
         assert_eq!(preflight(&layout).unwrap(), Preflight::Idle);
+    }
+
+    #[test]
+    fn pending_files_without_newer_fields_still_parse() {
+        let pending: Pending =
+            serde_json::from_str(r#"{"from":"cockroach-rollout-agent-v0.3.0","to":"0.3.1"}"#)
+                .unwrap();
+        assert_eq!(pending.starts, 0);
+    }
+
+    #[test]
+    fn agents_too_old_to_self_update_say_so() {
+        assert!(progress(Some("0.2.0"), None, None).contains("install-rollout-agent.sh"));
+        assert_eq!(
+            progress(Some("0.3.0"), Some("0.3.1"), None),
+            "updating to 0.3.1"
+        );
+        assert_eq!(progress(Some("0.3.0"), None, None), "");
     }
 
     #[test]
