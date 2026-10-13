@@ -1,0 +1,14 @@
+# file: examples/cockroach-rollout-agent-ui-cert.timer
+# version: 1.0.0
+# guid: 82592969-9417-4491-9b15-44e93ed247e9
+
+[Unit]
+Description=Daily check for an expiring cockroach-rollout-agent UI certificate
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

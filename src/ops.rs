@@ -16,6 +16,7 @@ use crate::rollout::{
     AgentObservation, MIN_RESTART_AGENT_VERSION, NodeObservation, RolloutKind, RolloutStatus,
     all_nodes_on, live_version_span, restart_agent_gaps,
 };
+use crate::uicert;
 use crate::{
     AppError, Cli, OpenRollout, RolloutManifest, agent_node_id, cluster_nodes, finalize_cluster,
     major_line_string, open_rollout, parse_cockroach_version, reject_prerelease,
@@ -398,6 +399,62 @@ pub fn check_releases(cli: &Cli, client: &mut Client, actor: &Actor) -> Result<S
          (at most once every {} minutes)",
         crate::DEFAULT_DAEMON_INTERVAL_SECONDS / 60,
         releases::CATALOG_MIN_REFRESH_SECS / 60
+    ))
+}
+
+/// Approves or rejects the staged UI certificate the operator looked at.
+pub fn decide_ui_cert(
+    cli: &Cli,
+    client: &mut Client,
+    actor: &Actor,
+    fingerprint: &str,
+    approve: bool,
+) -> Result<String, AppError> {
+    let by = actor.label(cli);
+    uicert::decide(cli, client, fingerprint, approve, &by)?;
+    let kind = if approve {
+        "ui_cert_approved"
+    } else {
+        "ui_cert_rejected"
+    };
+    events::note(
+        cli,
+        client,
+        actor.source(),
+        kind,
+        &format!("fingerprint={fingerprint} by={by}"),
+    )?;
+    Ok(if approve {
+        format!(
+            "approved certificate {fingerprint}; every agent installs it within one tick \
+             (about {} minutes)",
+            crate::DEFAULT_DAEMON_INTERVAL_SECONDS / 60
+        )
+    } else {
+        format!("rejected certificate {fingerprint}")
+    })
+}
+
+/// Stages an uploaded certificate after checking it against the UI CA.
+pub fn upload_ui_cert(
+    cli: &Cli,
+    client: &mut Client,
+    actor: &Actor,
+    pem: &uicert::Pem,
+) -> Result<String, AppError> {
+    let chain = crate::ui_ca_for_staging(cli, client)?;
+    let by = actor.label(cli);
+    let info = uicert::stage(cli, client, pem, &chain, &by, unix_time()? as i64)?;
+    events::note(
+        cli,
+        client,
+        actor.source(),
+        "ui_cert_uploaded",
+        &format!("fingerprint={} by={by}", info.fingerprint),
+    )?;
+    Ok(format!(
+        "staged certificate {}; review it below, then approve or reject it",
+        info.fingerprint
     ))
 }
 

@@ -14,7 +14,7 @@ pub mod tls;
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -41,6 +41,50 @@ pub trait Backend: Send + Sync + 'static {
     fn record_event(&self, kind: &str, detail: &str) -> Result<(), String>;
     fn view(&self) -> Result<ClusterView, String>;
     fn act(&self, action: WebAction, actor: &Actor) -> Result<String, String>;
+    /// A stored UI certificate's file, or `None` if no certificate has this
+    /// fingerprint. A key read is recorded as an event before it returns.
+    fn ui_cert_file(
+        &self,
+        fingerprint: &str,
+        file: CertFile,
+        actor: &Actor,
+    ) -> Result<Option<String>, String>;
+}
+
+/// The files a stored UI certificate can be downloaded as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertFile {
+    Cert,
+    Key,
+    /// The UI CA certificate the leaf chains to; this is what browsers trust.
+    Ca,
+}
+
+impl CertFile {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "cert.pem" => Some(Self::Cert),
+            "key.pem" => Some(Self::Key),
+            "ca.crt" => Some(Self::Ca),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cert => "cert.pem",
+            Self::Key => "key.pem",
+            Self::Ca => "ca.crt",
+        }
+    }
+}
+
+/// SHA-256 fingerprints as this code writes them: 64 lowercase hex digits.
+pub fn is_fingerprint(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A dashboard form, validated but not yet checked against cluster state.
@@ -62,6 +106,14 @@ pub enum WebAction {
     },
     Restart,
     CheckReleases,
+    UiCertDecide {
+        fingerprint: String,
+        approve: bool,
+    },
+    UiCertUpload {
+        cert_pem: String,
+        key_pem: String,
+    },
 }
 
 pub fn parse_action(name: &str, form: &HashMap<String, String>) -> Result<WebAction, String> {
@@ -91,6 +143,22 @@ pub fn parse_action(name: &str, form: &HashMap<String, String>) -> Result<WebAct
         "restart" if field("confirm") == "restart" => Ok(WebAction::Restart),
         "restart" => Err("type restart to confirm a rolling restart".to_string()),
         "check-releases" => Ok(WebAction::CheckReleases),
+        "ui-cert-approve" | "ui-cert-reject" if is_fingerprint(field("fingerprint")) => {
+            Ok(WebAction::UiCertDecide {
+                fingerprint: field("fingerprint").to_string(),
+                approve: name == "ui-cert-approve",
+            })
+        }
+        "ui-cert-approve" | "ui-cert-reject" => {
+            Err("the form is missing the certificate's fingerprint".to_string())
+        }
+        "ui-cert-upload" if !field("cert_pem").is_empty() && !field("key_pem").is_empty() => {
+            Ok(WebAction::UiCertUpload {
+                cert_pem: field("cert_pem").to_string(),
+                key_pem: field("key_pem").to_string(),
+            })
+        }
+        "ui-cert-upload" => Err("paste both the certificate and its key".to_string()),
         other => Err(format!("unknown action: {other}")),
     }
 }
@@ -107,14 +175,49 @@ where
         .map_err(|error| format!("internal error: {error}"))?
 }
 
+/// The running listener's TLS config, which the daemon swaps when a new
+/// UI certificate is approved. New connections get the new certificate;
+/// open ones finish on the old one.
+pub struct UiServer {
+    tls: RustlsConfig,
+    served: Mutex<Option<String>>,
+}
+
+impl UiServer {
+    pub fn new(tls: rustls::ServerConfig, served_fingerprint: Option<String>) -> Self {
+        Self {
+            tls: RustlsConfig::from_config(Arc::new(tls)),
+            served: Mutex::new(served_fingerprint),
+        }
+    }
+
+    /// Fingerprint of the certificate new connections receive.
+    pub fn served(&self) -> Option<String> {
+        self.served
+            .lock()
+            .map(|served| served.clone())
+            .unwrap_or_default()
+    }
+
+    /// Builds the new config first, so a bad pair leaves the old one serving.
+    pub fn install(&self, cert_pem: &str, key_pem: &str, fingerprint: &str) -> Result<(), String> {
+        let config = tls::server_config(cert_pem.as_bytes(), key_pem.as_bytes())?;
+        self.tls.reload_from_config(Arc::new(config));
+        if let Ok(mut served) = self.served.lock() {
+            *served = Some(fingerprint.to_string());
+        }
+        Ok(())
+    }
+}
+
 pub async fn serve(
     listener: TcpListener,
     state: routes::AppState,
-    tls: rustls::ServerConfig,
+    tls: RustlsConfig,
 ) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     let app = routes::router(state).into_make_service_with_connect_info::<SocketAddr>();
-    axum_server::from_tcp_rustls(listener, RustlsConfig::from_config(Arc::new(tls)))?
+    axum_server::from_tcp_rustls(listener, tls)?
         .serve(app)
         .await
 }
@@ -125,9 +228,10 @@ pub async fn serve(
 pub fn spawn(
     listen: SocketAddr,
     state: routes::AppState,
-    tls: rustls::ServerConfig,
+    server: Arc<UiServer>,
 ) -> io::Result<thread::JoinHandle<()>> {
     let listener = TcpListener::bind(listen)?;
+    let tls = server.tls.clone();
     thread::Builder::new()
         .name("web-ui".to_string())
         .spawn(move || {
@@ -168,6 +272,7 @@ mod tests {
         session_error: Option<String>,
         sessions: Mutex<HashMap<String, auth::Session>>,
         acted: Mutex<Vec<WebAction>>,
+        downloads: Mutex<Vec<String>>,
     }
 
     impl FakeBackend {
@@ -178,6 +283,7 @@ mod tests {
                 session_error: None,
                 sessions: Mutex::default(),
                 acted: Mutex::default(),
+                downloads: Mutex::default(),
             })
         }
     }
@@ -225,6 +331,21 @@ mod tests {
             self.acted.lock().unwrap().push(action);
             Ok("done".to_string())
         }
+        fn ui_cert_file(
+            &self,
+            fingerprint: &str,
+            file: CertFile,
+            _actor: &Actor,
+        ) -> Result<Option<String>, String> {
+            if fingerprint != "cd".repeat(32) {
+                return Ok(None);
+            }
+            self.downloads
+                .lock()
+                .unwrap()
+                .push(format!("{fingerprint} {}", file.name()));
+            Ok(Some(format!("{} of {fingerprint}", file.name())))
+        }
     }
 
     async fn start(fake: Arc<FakeBackend>) -> (String, reqwest::Client) {
@@ -238,7 +359,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let state = routes::AppState::new(fake, Duration::from_secs(3600));
-        tokio::spawn(serve(listener, state, tls));
+        tokio::spawn(serve(
+            listener,
+            state,
+            RustlsConfig::from_config(Arc::new(tls)),
+        ));
         let client = reqwest::Client::builder()
             .add_root_certificate(reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap())
             .redirect(reqwest::redirect::Policy::none())
@@ -470,6 +595,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_downloads_need_a_session_and_are_never_cached() {
+        let fake = FakeBackend::new(None);
+        let (base, client) = start(fake.clone()).await;
+        let fp = "cd".repeat(32);
+        let url = format!("{base}/ui-cert/{fp}/key.pem");
+        let anonymous = client.get(&url).send().await.unwrap();
+        assert_eq!(anonymous.status(), 303);
+        assert!(fake.downloads.lock().unwrap().is_empty());
+
+        let cookie = login(&base, &client).await;
+        let response = client
+            .get(&url)
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let disposition = response.headers()["content-disposition"].to_str().unwrap();
+        assert!(disposition.starts_with("attachment;"), "{disposition}");
+        assert_eq!(response.text().await.unwrap(), format!("key.pem of {fp}"));
+        assert_eq!(
+            *fake.downloads.lock().unwrap(),
+            vec![format!("{fp} key.pem")]
+        );
+
+        let missing = client
+            .get(format!("{base}/ui-cert/{}/key.pem", "ee".repeat(32)))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
+        let bad = client
+            .get(format!("{base}/ui-cert/{fp}/passwd"))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), 404);
+    }
+
+    #[tokio::test]
     async fn database_errors_show_a_banner_without_actions() {
         let (base, client) = start(FakeBackend::new(Some("connection refused"))).await;
         let cookie = login(&base, &client).await;
@@ -507,6 +675,48 @@ mod tests {
         assert!(html.contains("<main id=\"main\">"), "{html}");
         assert!(html.contains("database unreachable"), "{html}");
         assert!(!html.contains("/actions/"));
+    }
+
+    #[tokio::test]
+    async fn an_installed_certificate_serves_new_connections() {
+        use crate::uicert;
+        let now = time::OffsetDateTime::now_utc();
+        let hosts = uicert::hosts_from(&[], &["127.0.0.1:1".to_string()], &["ui.test".to_string()]);
+        // Loopback is never put in a UI certificate, so name the leaf for
+        // ui.test and resolve that name to the listener.
+        let ca = uicert::generate_ca(&hosts, now).unwrap();
+        let leaf = uicert::issue_leaf(&ca, &hosts, now, 30).unwrap();
+        let old = rcgen::generate_simple_self_signed(vec!["ui.test".to_string()]).unwrap();
+        let server = Arc::new(UiServer::new(
+            tls::server_config(
+                old.cert.pem().as_bytes(),
+                old.signing_key.serialize_pem().as_bytes(),
+            )
+            .unwrap(),
+            Some("old".to_string()),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = routes::AppState::new(FakeBackend::new(None), Duration::from_secs(3600));
+        tokio::spawn(serve(listener, state, server.tls.clone()));
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(ca.cert.as_bytes()).unwrap())
+            .resolve("ui.test", addr)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let url = format!("https://ui.test:{}/login", addr.port());
+        assert!(client.get(&url).send().await.is_err(), "still the old cert");
+        assert!(server.install("not a cert", "nor a key", "bad").is_err());
+        assert_eq!(
+            server.served().as_deref(),
+            Some("old"),
+            "a bad pair changes nothing"
+        );
+        server.install(&leaf.cert, &leaf.key, "new").unwrap();
+        let fresh = client.get(&url).send().await.unwrap();
+        assert_eq!(fresh.status(), 200);
+        assert_eq!(server.served().as_deref(), Some("new"));
     }
 
     #[test]
@@ -563,6 +773,40 @@ mod tests {
         assert_eq!(
             parse_action("check-releases", &form(&[])),
             Ok(WebAction::CheckReleases)
+        );
+        let fp = "ab".repeat(32);
+        assert_eq!(
+            parse_action("ui-cert-approve", &form(&[("fingerprint", fp.as_str())])),
+            Ok(WebAction::UiCertDecide {
+                fingerprint: fp.clone(),
+                approve: true
+            })
+        );
+        assert_eq!(
+            parse_action("ui-cert-reject", &form(&[("fingerprint", fp.as_str())])),
+            Ok(WebAction::UiCertDecide {
+                fingerprint: fp.clone(),
+                approve: false
+            })
+        );
+        assert!(parse_action("ui-cert-approve", &form(&[("fingerprint", "abc")])).is_err());
+        assert!(
+            parse_action(
+                "ui-cert-approve",
+                &form(&[("fingerprint", &"AB".repeat(32))])
+            )
+            .is_err()
+        );
+        assert!(parse_action("ui-cert-upload", &form(&[("cert_pem", "c")])).is_err());
+        assert_eq!(
+            parse_action(
+                "ui-cert-upload",
+                &form(&[("cert_pem", "c"), ("key_pem", "k")])
+            ),
+            Ok(WebAction::UiCertUpload {
+                cert_pem: "c".to_string(),
+                key_pem: "k".to_string()
+            })
         );
         assert!(parse_action("drop-table", &form(&[])).is_err());
     }

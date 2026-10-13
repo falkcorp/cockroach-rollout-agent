@@ -1,7 +1,7 @@
 // file: src/web/routes.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: f0fcb0b6-3ed3-41ea-a74c-a624cd821a36
-// last-edited: 2026-10-11
+// last-edited: 2026-10-12
 
 //! HTTP handlers. Each handler checks the session, then CSRF on POST, and
 //! reaches the backend only through `blocking`.
@@ -22,7 +22,7 @@ use tokio::sync::Semaphore;
 use tower_http::catch_panic::CatchPanicLayer;
 
 use super::auth::{self, LoginLimiter, Session};
-use super::{Backend, blocking, parse_action, render};
+use super::{Backend, CertFile, blocking, is_fingerprint, parse_action, render};
 use crate::ops::{Actor, available_actions};
 
 const FLASH_COOKIE: &str = "crra_flash";
@@ -57,6 +57,7 @@ pub fn router(state: AppState) -> Router {
         .route("/login", get(login_form).post(login))
         .route("/logout", post(logout))
         .route("/actions/{name}", post(action))
+        .route("/ui-cert/{fingerprint}/{file}", get(ui_cert_file))
         .route("/static/app.css", get(css))
         .route("/static/app.js", get(js))
         .layer(CatchPanicLayer::new())
@@ -320,6 +321,60 @@ async fn action(
         }
     };
     see_other("/", &[flash_cookie(&message)])
+}
+
+async fn ui_cert_file(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path((fingerprint, file)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    match session_of(&state, &headers).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return see_other("/login", &[]),
+        Err(error) => {
+            return page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                render::db_unreachable(&error),
+            );
+        }
+    }
+    let not_found = || {
+        page(
+            StatusCode::NOT_FOUND,
+            render::message_page("Not found", "No such certificate file."),
+        )
+    };
+    let Some(file) = CertFile::parse(&file).filter(|_| is_fingerprint(&fingerprint)) else {
+        return not_found();
+    };
+    let backend = state.backend.clone();
+    let actor = Actor::Web {
+        ip: peer.ip().to_string(),
+    };
+    let lookup = fingerprint.clone();
+    match blocking(move || backend.ui_cert_file(&lookup, file, &actor)).await {
+        Ok(Some(pem)) => {
+            let disposition = format!(
+                "attachment; filename=\"rollout-ui-{}-{}\"",
+                &fingerprint[..12],
+                file.name()
+            );
+            let mut response =
+                ([(header::CONTENT_TYPE, "application/x-pem-file")], pem).into_response();
+            if let Ok(value) = HeaderValue::from_str(&disposition) {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_DISPOSITION, value);
+            }
+            response
+        }
+        Ok(None) => not_found(),
+        Err(error) => page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            render::db_unreachable(&error),
+        ),
+    }
 }
 
 async fn logout(

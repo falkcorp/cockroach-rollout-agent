@@ -16,6 +16,7 @@ use crate::releases::{self, ReleasesView};
 use crate::rollout::{
     AgentObservation, NodeObservation, RolloutKind, RolloutStatus, live_version_span, stale_after,
 };
+use crate::uicert::{self, UiCertRow};
 use crate::{
     AppError, Cli, DEFAULT_DAEMON_INTERVAL_SECONDS, INSTALL_LEASE, LEADER_LEASE, OpenRollout,
     cluster_health, cluster_nodes, major_line, open_rollout, sql_ident,
@@ -36,6 +37,8 @@ pub struct ClusterView {
     pub stale_after_secs: u64,
     /// `None` until the leader has stored a release catalog.
     pub releases: Option<ReleasesView>,
+    /// The approved and staged UI certificates, newest first.
+    pub ui_certs: Vec<UiCertRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +112,10 @@ pub struct AgentRow {
     pub rollout_id: Option<String>,
     /// Seconds since the agent's last heartbeat.
     pub age_secs: i64,
+    /// The UI certificate this agent serves.
+    pub ui_cert_fingerprint: Option<String>,
+    /// Why this agent could not install the approved UI certificate.
+    pub ui_cert_error: Option<String>,
 }
 
 impl AgentRow {
@@ -246,6 +253,7 @@ pub fn load(cli: &Cli, client: &mut Client) -> Result<ClusterView, AppError> {
         stale_after_secs: stale_after(Duration::from_secs(DEFAULT_DAEMON_INTERVAL_SECONDS))
             .as_secs(),
         releases,
+        ui_certs: uicert::rows(cli, client)?,
     })
 }
 
@@ -257,7 +265,8 @@ pub fn agent_rows(cli: &Cli, client: &mut Client) -> Result<Vec<AgentRow>, AppEr
                 "
                 SELECT agent_id, state, version, error,
                        extract(epoch FROM now() - coalesce(last_seen, updated_at))::INT8,
-                       node_id, agent_version, restarted_rollout_id, rollout_id
+                       node_id, agent_version, restarted_rollout_id, rollout_id,
+                       ui_cert_fingerprint, ui_cert_error
                 FROM {schema}.agent_status
                 ORDER BY agent_id
                 "
@@ -277,6 +286,8 @@ pub fn agent_rows(cli: &Cli, client: &mut Client) -> Result<Vec<AgentRow>, AppEr
             error: row.get(3),
             rollout_id: row.get(8),
             age_secs: row.get(4),
+            ui_cert_fingerprint: row.get(9),
+            ui_cert_error: row.get(10),
         })
         .collect())
 }
@@ -335,6 +346,8 @@ impl ClusterView {
                     error: None,
                     rollout_id: None,
                     age_secs: 10,
+                    ui_cert_fingerprint: None,
+                    ui_cert_error: None,
                 })
                 .collect(),
             leases: vec![
@@ -358,6 +371,7 @@ impl ClusterView {
             events: Vec::new(),
             stale_after_secs: 900,
             releases: None,
+            ui_certs: Vec::new(),
         }
     }
 }

@@ -12,10 +12,11 @@ use std::time::Duration;
 
 use postgres::Client;
 
-use super::{Backend, WebAction, auth};
+use super::{Backend, CertFile, WebAction, auth};
 use crate::cluster_view::{self, ClusterView};
 use crate::events::{self, Source};
 use crate::ops::{self, Actor};
+use crate::uicert;
 use crate::{Cli, db_client, sql_ident};
 
 pub struct DbBackend {
@@ -135,7 +136,50 @@ impl Backend for DbBackend {
             }
             WebAction::Restart => ops::restart_cluster(cli, &mut client, actor),
             WebAction::CheckReleases => ops::check_releases(cli, &mut client, actor),
+            WebAction::UiCertDecide {
+                fingerprint,
+                approve,
+            } => ops::decide_ui_cert(cli, &mut client, actor, &fingerprint, approve),
+            WebAction::UiCertUpload { cert_pem, key_pem } => ops::upload_ui_cert(
+                cli,
+                &mut client,
+                actor,
+                &uicert::Pem {
+                    cert: cert_pem,
+                    key: key_pem,
+                },
+            ),
         }
         .map_err(text)
+    }
+
+    fn ui_cert_file(
+        &self,
+        fingerprint: &str,
+        file: CertFile,
+        actor: &Actor,
+    ) -> Result<Option<String>, String> {
+        let mut client = self.client()?;
+        let Some(material) =
+            uicert::material_any(&self.cli, &mut client, fingerprint).map_err(text)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match file {
+            CertFile::Cert => material.pem.cert,
+            CertFile::Ca => material.chain_pem,
+            CertFile::Key => {
+                // Recorded first: if the event cannot be written, the key is not served.
+                events::note(
+                    &self.cli,
+                    &mut client,
+                    actor.source(),
+                    "ui_cert_key_downloaded",
+                    &format!("fingerprint={fingerprint} by={}", actor.label(&self.cli)),
+                )
+                .map_err(text)?;
+                material.pem.key
+            }
+        }))
     }
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # file: scripts/install-rollout-agent.sh
-# version: 2.0.0
+# version: 2.1.0
 # guid: 963803cf-366e-40c7-bc9a-67bcd54597a9
-# last-edited: 2026-10-10
+# last-edited: 2026-10-12
 #
 # Installs or updates cockroach-rollout-agent on one CockroachDB host. Stages
 # the running CockroachDB version under the agent root and adds a systemd
@@ -31,6 +31,8 @@ LOG_DIR=/var/log/cockroach-rollout-agent
 CERTS_DIR=/etc/cockroach-rollout-agent/certs
 ENV_FILE=/etc/cockroach-rollout-agent.env
 UNIT_FILE=/etc/systemd/system/cockroach-rollout-agent.service
+UI_CERT_SERVICE=/etc/systemd/system/cockroach-rollout-agent-ui-cert.service
+UI_CERT_TIMER=/etc/systemd/system/cockroach-rollout-agent-ui-cert.timer
 POLKIT_FILE=/etc/polkit-1/rules.d/50-cockroach-rollout-agent.rules
 SYSTEM_BINARY=/usr/local/bin/cockroach
 AGENT_LINK=${AGENT_ROOT}/bin/cockroach
@@ -229,8 +231,9 @@ dropin_file="${dropin_dir}/${DROPIN_NAME}"
 
 if $uninstall; then
     systemctl disable --now cockroach-rollout-agent.service 2>/dev/null || true
+    systemctl disable --now cockroach-rollout-agent-ui-cert.timer 2>/dev/null || true
     remove_exec_dropin
-    rm -f "$POLKIT_FILE" "$UNIT_FILE"
+    rm -f "$POLKIT_FILE" "$UNIT_FILE" "$UI_CERT_SERVICE" "$UI_CERT_TIMER"
     systemctl daemon-reload
     log "uninstalled; $AGENT_ROOT, $LOG_DIR, $CERTS_DIR and $ENV_FILE were kept"
     exit 0
@@ -273,6 +276,8 @@ stage_current_binary
 log "writing env, unit, and polkit rule"
 render "$EXAMPLES_DIR/cockroach-rollout-agent.env.example" "$ENV_FILE" 0640 "root:$AGENT_USER"
 render "$EXAMPLES_DIR/cockroach-rollout-agent.service" "$UNIT_FILE" 0644 root:root
+render "$EXAMPLES_DIR/cockroach-rollout-agent-ui-cert.service" "$UI_CERT_SERVICE" 0644 root:root
+render "$EXAMPLES_DIR/cockroach-rollout-agent-ui-cert.timer" "$UI_CERT_TIMER" 0644 root:root
 install -d -o root -g root -m 0755 "$(dirname "$POLKIT_FILE")"
 render "$EXAMPLES_DIR/50-cockroach-rollout-agent.rules" "$POLKIT_FILE" 0644 root:root
 systemctl daemon-reload
@@ -293,8 +298,11 @@ fi
 
 if $enable; then
     systemctl enable --now cockroach-rollout-agent.service
+    # Harmless on nodes without the UI CA key: renew exits without acting.
+    systemctl enable --now cockroach-rollout-agent-ui-cert.timer
     log "agent enabled and started"
 else
     systemctl disable cockroach-rollout-agent.service 2>/dev/null || true
+    systemctl disable cockroach-rollout-agent-ui-cert.timer 2>/dev/null || true
     log "agent installed but left disabled (pass --enable to start it)"
 fi

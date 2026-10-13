@@ -13,6 +13,7 @@ use crate::health::safe_to_restart;
 use crate::ops::AvailableAction;
 use crate::releases::{LineMark, ReleasesView};
 use crate::rollout::NodeObservation;
+use crate::uicert::UiCertRow;
 
 pub const APP_CSS: &str = include_str!("assets/app.css");
 pub const APP_JS: &str = include_str!("assets/app.js");
@@ -102,6 +103,7 @@ pub fn dashboard(
     }
     main.push_str(&nodes_section(&view.nodes));
     main.push_str(&agents_section(&view.agents, view.stale_after_secs));
+    main.push_str(&ui_cert_section(&view.ui_certs, &view.agents, csrf));
     main.push_str(&locks_section(&view.leases));
     main.push_str(&health_section(view));
     main.push_str(&events_section(&view.events));
@@ -293,6 +295,114 @@ fn agents_section(agents: &[AgentRow], stale_after_secs: u64) -> String {
         rows,
         "No agents have reported.",
     )
+}
+
+fn utc_date(unix: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix)
+        .map(|at| at.date().to_string())
+        .unwrap_or_else(|_| unix.to_string())
+}
+
+fn cert_details(row: &UiCertRow) -> String {
+    let fp = &row.info.fingerprint;
+    let file = |name: &str, label: &str| {
+        format!(
+            "<a href=\"/ui-cert/{}/{}\">{}</a>",
+            escape(fp),
+            name,
+            escape(label)
+        )
+    };
+    format!(
+        "<dl><dt>Names</dt><dd>{}</dd><dt>Valid</dt><dd>{} to {}</dd>\
+         <dt>SHA-256</dt><dd><code>{}</code></dd><dt>Issuer</dt><dd>{}</dd>\
+         <dt>Staged by</dt><dd>{} at {}</dd></dl><p>{} · {} · {} (download is logged)</p>",
+        escape(&row.info.hosts().describe()),
+        utc_date(row.info.not_before),
+        utc_date(row.info.not_after),
+        escape(fp),
+        escape(&row.info.issuer),
+        escape(&row.created_by),
+        escape(&row.created_at),
+        file("ca.crt", "UI CA certificate"),
+        file("cert.pem", "certificate"),
+        file("key.pem", "private key"),
+    )
+}
+
+fn ui_cert_section(certs: &[UiCertRow], agents: &[AgentRow], csrf: &str) -> String {
+    let mut html = String::from("<section><h2>UI certificate</h2>");
+    let active = certs.iter().find(|row| row.status == "approved");
+    let staged = certs.iter().find(|row| row.status == "staged");
+    match active {
+        Some(row) => {
+            html.push_str("<h3>Approved</h3>");
+            html.push_str(&cert_details(row));
+        }
+        None => html.push_str(
+            "<p>No UI certificate is approved; agents serve their CockroachDB node \
+             certificates.</p>",
+        ),
+    }
+    if let Some(row) = staged {
+        let fp = escape(&row.info.fingerprint);
+        let field = format!(
+            "{}<input type=\"hidden\" name=\"fingerprint\" value=\"{fp}\">",
+            csrf_field(csrf)
+        );
+        html.push_str("<h3>Staged, waiting for approval</h3>");
+        html.push_str(&cert_details(row));
+        let _ = write!(
+            html,
+            "<form method=\"post\" action=\"/actions/ui-cert-approve\" class=\"action\">{field}\
+             <p>Every agent installs it on its next tick and keeps serving the old one \
+             if it cannot.</p><button type=\"submit\">Approve certificate</button></form>\
+             <form method=\"post\" action=\"/actions/ui-cert-reject\">{field}\
+             <button type=\"submit\">Reject</button></form>"
+        );
+    }
+    let rows = agents
+        .iter()
+        .map(|agent| {
+            vec![
+                agent.observation.agent_id.clone(),
+                agent
+                    .ui_cert_fingerprint
+                    .as_deref()
+                    .map(|fp| match active {
+                        Some(row) if row.info.fingerprint == fp => "approved".to_string(),
+                        _ => format!("{}…", &fp[..fp.len().min(12)]),
+                    })
+                    .unwrap_or_else(|| "node certificate".to_string()),
+                agent.ui_cert_error.clone().unwrap_or_default(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    if !rows.is_empty() {
+        html.push_str(
+            "<div class=\"scroll\"><table><thead><tr><th>Agent</th><th>Serving</th>\
+                       <th>Install error</th></tr></thead><tbody>",
+        );
+        for row in rows {
+            html.push_str("<tr>");
+            for cell in row {
+                let _ = write!(html, "<td>{}</td>", escape(&cell));
+            }
+            html.push_str("</tr>");
+        }
+        html.push_str("</tbody></table></div>");
+    }
+    let _ = write!(
+        html,
+        "<details><summary>Stage a certificate by hand</summary>\
+         <form method=\"post\" action=\"/actions/ui-cert-upload\" class=\"action\">{}\
+         <p>It must chain to the UI CA and is only staged: it still needs approval.</p>\
+         <label>Certificate PEM <textarea name=\"cert_pem\" rows=\"6\" required></textarea></label>\
+         <label>Private key PEM <textarea name=\"key_pem\" rows=\"6\" required></textarea></label>\
+         <button type=\"submit\">Stage</button></form></details></section>",
+        csrf_field(csrf)
+    );
+    html
 }
 
 fn locks_section(leases: &[LeaseRow]) -> String {
@@ -539,7 +649,10 @@ mod tests {
         ];
         let html = dashboard(&view, &actions, "tok123", None);
         let forms = html.matches("<form").count();
-        assert_eq!(forms, 4, "three actions plus sign out");
+        assert_eq!(
+            forms, 5,
+            "three actions, the certificate upload, and sign out"
+        );
         assert_eq!(
             html.matches("name=\"csrf\" value=\"tok123\"").count(),
             forms
@@ -572,7 +685,10 @@ mod tests {
         assert!(html.contains("action=\"/actions/decline\""));
         assert!(html.contains("name=\"rollout_id\" value=\"r-&lt;1&gt;\""));
         assert!(html.contains("Decline 26.1.8"));
-        assert_eq!(html.matches("name=\"csrf\" value=\"tok\"").count(), 2);
+        assert_eq!(
+            html.matches("name=\"csrf\" value=\"tok\"").count(),
+            html.matches("<form").count()
+        );
     }
 
     #[test]
@@ -623,7 +739,10 @@ mod tests {
         assert!(html.contains("href=\"https://www.cockroachlabs.com/docs/releases/v26.1\""));
         assert!(html.contains("last check failed: &lt;rate limited&gt;"));
         assert!(html.contains("action=\"/actions/check-releases\""));
-        assert_eq!(html.matches("name=\"csrf\" value=\"tok\"").count(), 2);
+        assert_eq!(
+            html.matches("name=\"csrf\" value=\"tok\"").count(),
+            html.matches("<form").count()
+        );
     }
 
     #[test]
@@ -646,5 +765,45 @@ mod tests {
             "settings warnings need the checkbox"
         );
         assert!(html.contains("<details><summary>2 other defaults change</summary>"));
+    }
+
+    #[test]
+    fn ui_cert_panel_shows_staged_details_downloads_and_bound_decisions() {
+        use crate::uicert::{CertInfo, UiCertRow};
+        let fp = "ab".repeat(32);
+        let mut view = ClusterView::sample();
+        view.agents[0].ui_cert_fingerprint = Some(fp.clone());
+        view.agents[1].ui_cert_error = Some("not <among> the names".to_string());
+        view.ui_certs = vec![UiCertRow {
+            info: CertInfo {
+                fingerprint: fp.clone(),
+                subject: "CN=cockroach-rollout-agent UI".to_string(),
+                issuer: "CN=Rollout UI CA".to_string(),
+                dns: vec!["len-serv-001".to_string()],
+                ips: vec!["172.16.3.92".parse().unwrap()],
+                not_before: 0,
+                not_after: 86_400 * 397,
+            },
+            status: "staged".to_string(),
+            created_by: "len-serv-001:amd64".to_string(),
+            created_at: "2026-10-12".to_string(),
+            decided_by: None,
+        }];
+        let html = dashboard(&view, &[], "tok", None);
+        assert!(html.contains("<h2>UI certificate</h2>"));
+        assert!(html.contains("len-serv-001, 172.16.3.92"));
+        assert!(html.contains(&format!("href=\"/ui-cert/{fp}/key.pem\"")));
+        assert!(html.contains(&format!("href=\"/ui-cert/{fp}/ca.crt\"")));
+        assert!(html.contains("action=\"/actions/ui-cert-approve\""));
+        assert!(html.contains("action=\"/actions/ui-cert-reject\""));
+        assert_eq!(
+            html.matches(&format!("name=\"fingerprint\" value=\"{fp}\""))
+                .count(),
+            2
+        );
+        assert!(html.contains("not &lt;among&gt; the names"));
+        assert!(html.contains("action=\"/actions/ui-cert-upload\""));
+        let forms = html.matches("<form").count();
+        assert_eq!(html.matches("name=\"csrf\" value=\"tok\"").count(), forms);
     }
 }
