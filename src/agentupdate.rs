@@ -1,5 +1,5 @@
 // file: src/agentupdate.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: e71c32fe-ae0a-49fb-9de9-6333f4abfd23
 // last-edited: 2026-10-13
 
@@ -257,6 +257,32 @@ pub fn progress(agent_version: Option<&str>, to: Option<&str>, error: Option<&st
         (None, Some(note)) => note.to_string(),
         (None, None) => String::new(),
     }
+}
+
+/// Whether `error`, or anything it wraps, says the network path is down
+/// (refused, reset, unreachable, timed out). A freshly updated agent that
+/// cannot reach its node is waiting on the environment, not failing, so
+/// its confirm deadline does not run out.
+pub fn is_unreachable(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(io) = error.downcast_ref::<io::Error>()
+            && matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::HostUnreachable
+                    | io::ErrorKind::NetworkUnreachable
+            )
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 /// Recorded before the agent restarts into a new binary.
@@ -846,6 +872,28 @@ mod tests {
         clear_rolled_back(&layout).unwrap();
         assert_eq!(read_rolled_back(&layout).unwrap(), None);
         assert_eq!(preflight(&layout).unwrap(), Preflight::Idle);
+    }
+
+    #[test]
+    fn only_network_failures_count_as_unreachable() {
+        #[derive(Debug)]
+        struct Wrapper(io::Error);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "wrapped")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let refused = Wrapper(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert!(is_unreachable(&refused));
+        assert!(is_unreachable(&io::Error::from(io::ErrorKind::TimedOut)));
+        let denied = Wrapper(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(!is_unreachable(&denied));
+        assert!(!is_unreachable(&io::Error::other("tls handshake failed")));
     }
 
     #[test]
