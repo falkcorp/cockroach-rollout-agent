@@ -827,7 +827,7 @@ fn db_daemon_command(
     let layout = BinaryLayout::agent(&cli.agent_root);
     // Left by `agent-preflight` after it restored this binary; reported once
     // the DB is reachable, and it keeps the failed version from retrying.
-    let mut rolled_back = agentupdate::take_rolled_back(&layout).unwrap_or_else(|error| {
+    let mut rolled_back = agentupdate::read_rolled_back(&layout).unwrap_or_else(|error| {
         eprintln!("cannot read the rollback note: {error}");
         None
     });
@@ -874,9 +874,20 @@ fn db_daemon_command(
         })();
         match result {
             Ok(restart) => {
-                rolled_back = None;
+                if rolled_back.take().is_some() {
+                    // Recorded in the DB now, so the note can go.
+                    agentupdate::clear_rolled_back(&layout)?;
+                }
                 if confirm_by.take().is_some() {
-                    agentupdate::remove_file_if_present(&agentupdate::pending_path(&layout))?;
+                    // Only this binary's own pending update: a later one
+                    // written this tick is not confirmed yet.
+                    if agentupdate::read_pending(&layout)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|pending| pending.to == agentupdate::own_version())
+                    {
+                        agentupdate::remove_file_if_present(&agentupdate::pending_path(&layout))?;
+                    }
                     audit(cli, "agent_update_confirmed", env!("CARGO_PKG_VERSION"))?;
                 }
                 if restart {
@@ -962,13 +973,10 @@ fn agent_self_update(cli: &Cli, client: &mut Client, agent_id: &str) -> Result<b
     let own = agentupdate::own_version();
     let approved = agentupdate::newest_approved(cli, client)?;
     let target = approved.as_ref().map(|release| &release.version);
-    let marker = agentupdate::marker(cli, client, agent_id)?;
-    let in_flight = match target {
-        Some(target) => agentupdate::in_flight(cli, client, agent_id, target)?,
-        None => Vec::new(),
-    };
+    let (marker, note) = agentupdate::claim_state(cli, client, agent_id)?;
+    let in_flight = agentupdate::in_flight(cli, client, agent_id)?;
     let layout_problem = agent_layout_problem(cli);
-    if marker.is_none() {
+    if marker.is_none() && note != layout_problem {
         // A note that blocks nobody: shows which nodes still need the
         // one-time reinstall onto the agent layout.
         agentupdate::set_error(cli, client, agent_id, layout_problem.as_deref())?;
@@ -999,19 +1007,10 @@ fn agent_self_update(cli: &Cli, client: &mut Client, agent_id: &str) -> Result<b
             if lease_holder(cli, client, INSTALL_LEASE)?.as_deref() == Some(agent_id) {
                 return Ok(false);
             }
-            let release = approved.expect("Start implies an approved release");
-            // Before the claim: a failed download is retried next tick and
-            // must not hold the other agents back.
-            let tarball = match download_agent_release(cli, &release) {
-                Ok(path) => path,
-                Err(error) => {
-                    audit(cli, "agent_update_download_failed", &error.to_string())?;
-                    return Ok(false);
-                }
-            };
             if !agentupdate::claim(cli, client, agent_id, &target)? {
                 return Ok(false);
             }
+            let release = approved.expect("Start implies an approved release");
             events::note(
                 cli,
                 client,
@@ -1019,15 +1018,29 @@ fn agent_self_update(cli: &Cli, client: &mut Client, agent_id: &str) -> Result<b
                 "agent_update_started",
                 &format!("{own} -> {target}"),
             )?;
+            let tarball = match download_agent_release(cli, &release) {
+                Ok(path) => path,
+                Err(error) => {
+                    // Not the build's fault: let go so the next tick, or
+                    // another agent, tries again, and show why.
+                    let message = format!("download of {target} failed: {error}");
+                    agentupdate::clear_marker(cli, client, agent_id)?;
+                    agentupdate::set_error(cli, client, agent_id, Some(&message))?;
+                    audit(cli, "agent_update_download_failed", &message)?;
+                    return Ok(false);
+                }
+            };
             match install_agent_release(cli, &release, &tarball) {
                 Ok(()) => {
-                    events::note(
+                    // The link already points at the new binary: nothing may
+                    // stop this agent from exiting into it now.
+                    let _ = events::note(
                         cli,
                         client,
                         Source::Agent,
                         "agent_update_restarting",
                         &format!("{own} -> {target}"),
-                    )?;
+                    );
                     Ok(true)
                 }
                 Err(error) => {
@@ -1075,7 +1088,7 @@ fn download_agent_release(
         .root()
         .join("downloads")
         .join(agentupdate::tarball_name(&arch));
-    download_public(&asset.url, &tarball)?;
+    download_public(&asset.url, &tarball, agentupdate::MAX_TARBALL_BYTES)?;
     Ok(tarball)
 }
 
@@ -1139,8 +1152,27 @@ fn install_agent_release(
         )));
     }
 
+    // Roll back to what is running, not to what the link says: after a swap
+    // whose exit was lost, the link already names the new version.
+    let running = std::env::current_exe()?;
+    let from = running
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|_| running.parent() == fs::canonicalize(layout.versions_dir()).ok().as_deref())
+        .ok_or_else(|| {
+            AppError::Message(format!(
+                "this agent runs {}, outside {}",
+                running.display(),
+                layout.versions_dir().display()
+            ))
+        })?;
+    if from == layout.version_file_name(&release.version) {
+        return Err(AppError::Message(format!(
+            "already running {}",
+            release.version
+        )));
+    }
     layout.stage(&extracted, &release.version)?;
-    let from = layout.current_target_name()?;
     // Written before the swap, so a new binary that never settles is always
     // counted and rolled back by `agent-preflight`.
     agentupdate::write_pending(
@@ -1156,13 +1188,14 @@ fn install_agent_release(
         let _ = agentupdate::remove_file_if_present(&agentupdate::pending_path(&layout));
         return Err(error.into());
     }
-    audit(
+    // From here on the swap is done; failures are only logged.
+    let _ = audit(
         cli,
         "agent_update_swapped",
         &format!("from={from} to={}", release.version),
-    )?;
+    );
     if let Err(error) = layout.prune(Some(&from)) {
-        audit(cli, "agent_prune_failed", &error.to_string())?;
+        let _ = audit(cli, "agent_prune_failed", &error.to_string());
     }
     let _ = fs::remove_file(tarball);
     Ok(())
@@ -1227,6 +1260,7 @@ fn agent_update_report(cli: &Cli, client: &mut Client) -> Result<String, AppErro
             agent.observation.agent_id,
             agent.observation.agent_version.as_deref().unwrap_or("?"),
             agentupdate::progress(
+                agent.observation.agent_version.as_deref(),
                 agent.agent_update_to.as_deref(),
                 agent.agent_update_error.as_deref()
             )
@@ -3793,19 +3827,32 @@ fn download_to_file(url: &str, destination: &Path) -> Result<(), AppError> {
 
 /// Downloads without the manifest PSK: release assets live on GitHub, which
 /// must never see that credential.
-fn download_public(url: &str, destination: &Path) -> Result<(), AppError> {
+/// Stops past `max_bytes` and deletes whatever it wrote on any failure, so
+/// a hostile or broken asset cannot fill the disk.
+fn download_public(url: &str, destination: &Path, max_bytes: u64) -> Result<(), AppError> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut response = reqwest::blocking::Client::new()
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "cockroach-rollout-agent")
-        .send()?
-        .error_for_status()?;
-    let mut output = fs::File::create(destination)?;
-    io::copy(&mut response, &mut output)?;
-    output.sync_all()?;
-    Ok(())
+    let result = (|| -> Result<(), AppError> {
+        let response = reqwest::blocking::Client::new()
+            .get(url)
+            .header(reqwest::header::USER_AGENT, "cockroach-rollout-agent")
+            .send()?
+            .error_for_status()?;
+        let mut output = fs::File::create(destination)?;
+        let copied = io::copy(&mut response.take(max_bytes + 1), &mut output)?;
+        if copied > max_bytes {
+            return Err(AppError::Message(format!(
+                "{url} is larger than {max_bytes} bytes"
+            )));
+        }
+        output.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(destination);
+    }
+    result
 }
 
 /// Like `fetch_text`, without the manifest PSK.

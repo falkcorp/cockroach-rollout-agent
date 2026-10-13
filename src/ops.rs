@@ -437,13 +437,17 @@ pub fn decide_agent_release(
     })
 }
 
-/// Lets agents whose update failed try again.
+/// Lets agents whose update failed try again, and drops claims of agents
+/// that have stopped reporting.
 pub fn retry_agent_update(
     cli: &Cli,
     client: &mut Client,
     actor: &Actor,
 ) -> Result<String, AppError> {
-    let cleared = agentupdate::retry(cli, client)?;
+    let stale = crate::rollout::stale_after(std::time::Duration::from_secs(
+        crate::DEFAULT_DAEMON_INTERVAL_SECONDS,
+    ));
+    let cleared = agentupdate::retry(cli, client, stale.as_secs())?;
     events::note(
         cli,
         client,
@@ -451,7 +455,9 @@ pub fn retry_agent_update(
         "agent_update_retry",
         &format!("cleared={cleared} by={}", actor.label(cli)),
     )?;
-    Ok(format!("{cleared} failed agent update(s) will be retried"))
+    Ok(format!(
+        "cleared {cleared} failed or abandoned agent update claim(s)"
+    ))
 }
 
 /// Approves or rejects the staged UI certificate the operator looked at.

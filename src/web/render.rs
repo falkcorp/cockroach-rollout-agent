@@ -107,6 +107,7 @@ pub fn dashboard(
     main.push_str(&agent_update_section(
         &view.agent_releases,
         &view.agents,
+        &view.leases,
         csrf,
     ));
     main.push_str(&ui_cert_section(&view.ui_certs, &view.agents, csrf));
@@ -411,8 +412,37 @@ fn ui_cert_section(certs: &[UiCertRow], agents: &[AgentRow], csrf: &str) -> Stri
     html
 }
 
-fn agent_update_section(releases: &[AgentReleaseRow], agents: &[AgentRow], csrf: &str) -> String {
+fn agent_update_section(
+    releases: &[AgentReleaseRow],
+    agents: &[AgentRow],
+    leases: &[LeaseRow],
+    csrf: &str,
+) -> String {
     let mut html = String::from("<section><h2>Agent updates</h2>");
+    let leader = leases
+        .iter()
+        .find(|lease| lease.name == crate::LEADER_LEASE)
+        .and_then(|lease| lease.holder.as_deref())
+        .and_then(|holder| {
+            agents
+                .iter()
+                .find(|agent| agent.observation.agent_id == holder)
+        });
+    if let Some((leader, version)) = leader.and_then(|agent| {
+        let version = agent.observation.agent_version.as_deref()?;
+        semver::Version::parse(version)
+            .ok()
+            .filter(|version| *version < crate::agentupdate::MIN_SELF_UPDATE_VERSION)
+            .map(|_| (agent, version))
+    }) {
+        let _ = write!(
+            html,
+            "<p>The leader, {}, runs agent {} and cannot propose agent updates. \
+             Reinstall it with install-rollout-agent.sh.</p>",
+            escape(&leader.observation.agent_id),
+            escape(version)
+        );
+    }
     let open: Vec<&AgentReleaseRow> = releases
         .iter()
         .filter(|row| matches!(row.status.as_str(), "proposed" | "approved"))
@@ -471,6 +501,7 @@ fn agent_update_section(releases: &[AgentReleaseRow], agents: &[AgentRow], csrf:
                     .clone()
                     .unwrap_or_else(|| "—".to_string()),
                 crate::agentupdate::progress(
+                    agent.observation.agent_version.as_deref(),
                     agent.agent_update_to.as_deref(),
                     agent.agent_update_error.as_deref(),
                 ),
@@ -913,6 +944,9 @@ mod tests {
         use crate::agentupdate::{AgentReleaseRow, Asset};
         let digest = "cd".repeat(32);
         let mut view = ClusterView::sample();
+        for agent in &mut view.agents {
+            agent.observation.agent_version = Some("0.3.0".to_string());
+        }
         view.agents[0].agent_update_to = Some("0.3.1".to_string());
         view.agents[1].agent_update_error = Some("runs /usr/<local>/bin".to_string());
         view.agents[2].agent_update_to = Some("0.3.1".to_string());
@@ -960,7 +994,15 @@ mod tests {
         assert!(html.contains("runs /usr/&lt;local&gt;/bin"));
         assert!(html.contains("update to 0.3.1 failed: self-check failed"));
         assert!(html.contains("action=\"/actions/agent-update-retry\""));
+        assert!(!html.contains("cannot propose"));
         let forms = html.matches("<form").count();
         assert_eq!(html.matches("name=\"csrf\" value=\"tok\"").count(), forms);
+    }
+
+    #[test]
+    fn an_old_leader_and_old_agents_are_called_out() {
+        let html = dashboard(&ClusterView::sample(), &[], "tok", None);
+        assert!(html.contains("The leader, host1:amd64, runs agent 0.1.0 and cannot propose"));
+        assert!(html.contains("cannot update itself before 0.3.0"));
     }
 }
