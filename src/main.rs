@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 3.15.0
+// version: 3.16.0
 // guid: d16be11a-b10c-4d2e-853f-d4a1c0a3c617
 // last-edited: 2026-10-13
 
@@ -902,6 +902,13 @@ fn db_daemon_command(
             Err(error) => {
                 audit(cli, "db_daemon_tick_failed", &error.to_string())?;
                 eprintln!("db daemon tick failed: {error}");
+                if confirm_by.is_some() && agentupdate::is_unreachable(&error) {
+                    // The node or network is down, not this binary: restart
+                    // the clock rather than roll back a good build.
+                    confirm_by = Some(
+                        Instant::now() + Duration::from_secs(agentupdate::CONFIRM_DEADLINE_SECS),
+                    );
+                }
                 if confirm_by.is_some_and(|deadline| Instant::now() >= deadline) {
                     audit(
                         cli,
