@@ -1576,7 +1576,26 @@ fn db_client(cli: &Cli) -> Result<Client, AppError> {
     let tls = builder
         .build()
         .map_err(|error| AppError::Message(error.to_string()))?;
-    Ok(Client::connect(database_url, MakeTlsConnector::new(tls))?)
+    let mut client = Client::connect(database_url, MakeTlsConnector::new(tls))?;
+    allow_internals(&mut client)?;
+    Ok(client)
+}
+
+/// CockroachDB 26.1 refuses `crdb_internal` and `system` reads unless the
+/// session opts in, and the agent reads `crdb_internal.gossip_nodes` to see
+/// each node's liveness and build. Without this an upgraded node never looks
+/// healthy and every 26.1 install rolls back. Older releases that do not know
+/// the variable already allow the reads.
+fn allow_internals(client: &mut Client) -> Result<(), AppError> {
+    match client.batch_execute("SET allow_unsafe_internals = true") {
+        Ok(()) => Ok(()),
+        Err(error) if unknown_session_variable(&error.to_string()) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn unknown_session_variable(message: &str) -> bool {
+    message.contains("unrecognized configuration parameter")
 }
 
 fn ensure_schema(cli: &Cli, client: &mut Client) -> Result<(), AppError> {
@@ -2936,6 +2955,16 @@ fn unix_time() -> Result<u64, AppError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_unknown_variable_is_ignored_when_allowing_internals() {
+        assert!(unknown_session_variable(
+            "db error: ERROR: unrecognized configuration parameter \"allow_unsafe_internals\""
+        ));
+        assert!(!unknown_session_variable(
+            "db error: ERROR: permission denied to set allow_unsafe_internals"
+        ));
+    }
+
     use super::*;
 
     #[test]
