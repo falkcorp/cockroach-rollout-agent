@@ -1,7 +1,7 @@
 <!-- file: docs/deploy.md -->
-<!-- version: 2.3.0 -->
+<!-- version: 2.4.0 -->
 <!-- guid: 41eb3d6e-f70e-431d-8f3e-33d1ca5e45c1 -->
-<!-- last-edited: 2026-10-11 -->
+<!-- last-edited: 2026-10-12 -->
 
 # Deployment
 
@@ -124,7 +124,13 @@ Treat a failed self-check as a blocker.
    ```
 
 2. **Review the proposal.** Within one tick, the leader records the next
-   release-line step as `proposed`.
+   release-line step as `proposed`. The proposal carries two kinds of
+   warning:
+   - release-note matches;
+   - a **settings diff**: every cluster setting you override that the target
+     removes, retypes, or re-defaults, found by running
+     `gen settings-list` on both binaries.
+   Other default changes are listed for context.
 
    ```bash
    sudo -u cockroach env $(sudo cat /etc/cockroach-rollout-agent.env | xargs) \
@@ -138,8 +144,12 @@ Treat a failed self-check as a blocker.
    cockroach-rollout-agent approve v25.4.1
    ```
 
-   If the release notes matched a warning pattern, read them first, then add
-   `--accept-release-note-warnings`.
+   If the release notes or the settings diff produced warnings, review them
+   first, then add `--accept-release-note-warnings`.
+
+   **Not now?** `decline` refuses the proposal, and the leader never
+   proposes that version again. A newer patch is still proposed.
+   `undecline <version>` reverses it.
 
 4. **Watch it.** Use `status`, `journalctl -u cockroach-rollout-agent -f`, and
    `/var/log/cockroach-rollout-agent/audit.log`.
@@ -153,12 +163,19 @@ Treat a failed self-check as a blocker.
   rollout `failed`, which halts every other node. Investigate, then run
   `cancel`.
 - **Cancel:** `cancel` works on a proposed or active rollout too. Nodes that
-  already upgraded stay upgraded.
+  already upgraded stay upgraded. A cancelled proposal comes back on the
+  next tick; use `decline` to stop it.
+- **Release list:** the leader fetches CockroachDB's release tags from GitHub
+  at most hourly and caches them in `<schema>.release_catalog`. Proposals
+  and the dashboard's Releases panel read the cache. **Check now** on the
+  dashboard asks for a fetch on the next tick, at most once every 10
+  minutes.
 
 ## 6. Web UI
 
-Every agent serves the same dashboard at `https://<node-ip>:38090/`, using
-that node's own `node.crt` and `node.key`.
+Every agent serves the same dashboard at `https://<node-ip>:38090/`. It
+uses the approved UI certificate (see below) once one exists. Before that,
+it uses the node's own `node.crt` and `node.key`.
 
 - **What it does:** shows rollouts, nodes, agents, locks, health and recent
   events. You can approve, cancel or finalize an upgrade, and start a
@@ -176,9 +193,11 @@ that node's own `node.crt` and `node.key`.
    - Running the command again changes the password and signs out every
      session.
 
-2. **Trust the cluster CA in your browser.** Import the cluster's `ca.crt`
-   as a trusted authority, the same file CockroachDB clients use. Each
-   node's certificate carries its IP, so any node's URL verifies.
+2. **Trust a CA in your browser.** Use the Rollout UI CA from the next
+   section. Until it exists, use the cluster's `ca.crt`.
+   - **macOS:** Safari and Chrome refuse CockroachDB's default 5-year node
+     certificates even with the cluster CA trusted, because Apple caps TLS
+     certificates at 825 days. Use the UI CA.
 
 3. **Check it.** `cockroach-rollout-agent self-check` reports `ui tls` with
    the address and certificate it will use.
@@ -191,6 +210,61 @@ that node's own `node.crt` and `node.key`.
   - **If a node does not come back:** if a node fails to rejoin within
     `CROACH_ROLLOUT_RESTART_TIMEOUT_SECONDS`, the restart becomes `failed`
     and halts. Investigate, then cancel it.
+### UI certificates
+
+The UI has its own private CA, kept apart from the cluster CA.
+
+- **Name-constrained.** It may only sign for this cluster's hostnames and
+  node IPs. Trusting it in a browser vouches for nothing else.
+- **What it signs.** 397-day leaf certificates, which every browser
+  accepts.
+- **Approval.** A person approves every certificate before any agent
+  serves it.
+
+1. **Create the CA on one node.** This uses every agent's hostname and
+   every node's IP. Add `--extra-name` for anything else.
+
+   ```bash
+   sudo -u cockroach bash -c 'set -a; . /etc/cockroach-rollout-agent.env; cockroach-rollout-agent ui-cert init-ca'
+   ```
+
+   The key stays in `/var/lib/cockroach-rollout-agent/ui-ca/` on that node,
+   mode 0600. It is never stored in the database. Adding a host later needs
+   a new CA, which you then trust again.
+
+2. **Stage the first certificate.** After this, the daily
+   `cockroach-rollout-agent-ui-cert.timer` stages renewals 30 days before
+   expiry, and only on the node with the CA key.
+
+   ```bash
+   sudo -u cockroach bash -c 'set -a; . /etc/cockroach-rollout-agent.env; cockroach-rollout-agent ui-cert renew'
+   ```
+
+3. **Review and approve it on the dashboard.**
+   - The **UI certificate** panel shows the staged certificate's names,
+     validity and SHA-256.
+   - It links the CA certificate, the leaf, and the private key. Every key
+     download is logged.
+   - Approve or reject it. The CLI equivalents are
+     `ui-cert approve <sha256>` and `ui-cert reject <sha256>`.
+
+4. **Distribution.** Within one tick every agent installs the approved
+   certificate:
+   - it checks the certificate against the CA and against its own hostname
+     and IP;
+   - it writes it under `ui-certs/`, keeping the previous pair;
+   - it hot-reloads, with no restart.
+
+   An agent that cannot use it keeps its old certificate and shows why in
+   the panel.
+
+5. **Trust the UI CA.** Download it from the panel. On macOS:
+   `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain rollout-ui-ca.crt`.
+
+You can also paste a certificate and key into the panel's **Stage a
+certificate by hand**. It must chain to the UI CA, and it still needs
+approval.
+
 - **Disabling the UI:** set `CROACH_ROLLOUT_UI_LISTEN=off`. If the
   certificate cannot be loaded, the agent logs `ui disabled: <reason>` and
   keeps running. It never serves plain HTTP.

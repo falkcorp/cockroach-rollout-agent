@@ -1,7 +1,7 @@
 <!-- file: docs/security.md -->
-<!-- version: 2.3.0 -->
+<!-- version: 2.4.0 -->
 <!-- guid: b1107208-a9c3-4018-9e86-a44cbf5c7f79 -->
-<!-- last-edited: 2026-10-11 -->
+<!-- last-edited: 2026-10-12 -->
 
 # Security Model
 
@@ -58,8 +58,30 @@ The rollout agent must be treated as privileged infrastructure automation.
 - **CSRF:** every state-changing form carries a per-session CSRF token,
   compared in constant time. A mismatch returns 403 and records a
   `csrf_rejected` event.
-- **TLS:** TLS 1.2 or 1.3, using the node's own CockroachDB certificate.
-  The UI never serves plain HTTP.
+- **TLS:** TLS 1.2 or 1.3. The UI never serves plain HTTP. It uses the
+  approved UI certificate, or the node's own CockroachDB certificate until
+  one is approved.
+- **UI CA:**
+  - **Name constraints.** Critical X.509 name constraints limit it to the
+    cluster's hostnames and node IPs, so a leaked CA key cannot impersonate
+    any other site to a browser that trusts it. A unit test checks that
+    webpki refuses a leaf outside the constraints.
+  - **CA key.** It lives on one node, `ui-ca/ca.key` mode 0600, owned by
+    the agent user. It is never stored in the database.
+- **UI leaf key:**
+  - **Where it is stored.** In `<schema>.ui_certs`, so every agent can
+    install it. Anyone who can read that schema, which today means the
+    `rollout` client certificate, can impersonate the UI on the LAN. That
+    certificate can already approve upgrades, so this adds no new
+    authority.
+  - **Approval.** Approval is bound to the certificate's SHA-256.
+  - **Downloads.** A key download needs a session, is sent `no-store` as
+    an attachment, and is recorded as `ui_cert_key_downloaded` before it is
+    served.
+- **Settings diff:** only values of plain types (bool, int, float,
+  duration, enum, byte size) are shown. `cluster.secret`,
+  `enterprise.license` and `cloudstorage.http.custom_ca` are always
+  redacted. Setting values never go into events or audit logs.
 - **Security headers:** `Content-Security-Policy` (`default-src 'self'`,
   no framing), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
   `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.

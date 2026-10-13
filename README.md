@@ -1,7 +1,7 @@
 <!-- file: README.md -->
-<!-- version: 4.2.0 -->
+<!-- version: 4.3.0 -->
 <!-- guid: c68a62ce-72d1-45cc-a6c8-d3dfc41d0e34 -->
-<!-- last-edited: 2026-10-11 -->
+<!-- last-edited: 2026-10-12 -->
 
 # cockroach-rollout-agent
 
@@ -14,7 +14,8 @@ target system, or a secret manager.
 
 ## Current Scope
 
-- Discovers production CockroachDB versions from the upstream GitHub tags API.
+- Discovers production CockroachDB versions from the upstream GitHub tags API
+  in one call; in SQL mode the leader caches the list hourly in the database.
 - Refuses alpha, beta, RC, and other prerelease builds.
 - Plans upgrades release-line by release-line using CockroachDB `vYY.R` major
   lines.
@@ -54,6 +55,11 @@ cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" daemon --dry-run
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" status
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" approve v25.4.1
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" cancel --reason "..."
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" decline --reason "not yet"
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" undecline v26.1.8
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" ui-cert init-ca
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" ui-cert renew
+cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" ui-cert show
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" restart-cluster
 cargo run -- --database-url "$COCKROACH_ROLLOUT_DATABASE_URL" set-ui-password
 ```
