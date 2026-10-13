@@ -1,7 +1,7 @@
 // file: src/web/render.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 7e2b2274-de88-426c-bdd9-4faeced6f062
-// last-edited: 2026-10-11
+// last-edited: 2026-10-12
 
 //! HTML for the web UI. Every dynamic value passes through `escape`, and the
 //! public functions take typed values, never pre-built HTML.
@@ -323,6 +323,17 @@ fn action_form(action: &AvailableAction, csrf: &str) -> String {
                  <button type=\"submit\">Approve</button></form>"
             )
         }
+        AvailableAction::Decline { rollout_id, target } => format!(
+            "<form method=\"post\" action=\"/actions/decline\" class=\"action\">{csrf}\
+             <input type=\"hidden\" name=\"rollout_id\" value=\"{}\">\
+             <h3>Decline {}</h3>\
+             <p>Not now: the leader will not propose this version again. \
+             A newer patch is still proposed.</p>\
+             <label>Reason <input name=\"reason\" autocomplete=\"off\"></label>\
+             <button type=\"submit\">Decline</button></form>",
+            escape(rollout_id),
+            escape(&target.to_string())
+        ),
         AvailableAction::Cancel => format!(
             "<form method=\"post\" action=\"/actions/cancel\" class=\"action\">{csrf}\
              <h3>Cancel the open rollout</h3>\
@@ -448,5 +459,19 @@ mod tests {
         );
         assert!(html.contains("node 3 has no agent"));
         assert!(!html.contains("/actions/restart"));
+    }
+
+    #[test]
+    fn decline_posts_the_rollout_id_with_csrf() {
+        let view = ClusterView::sample();
+        let decline = AvailableAction::Decline {
+            rollout_id: "r-<1>".to_string(),
+            target: Version::new(26, 1, 8),
+        };
+        let html = dashboard(&view, &[decline], "tok", None);
+        assert!(html.contains("action=\"/actions/decline\""));
+        assert!(html.contains("name=\"rollout_id\" value=\"r-&lt;1&gt;\""));
+        assert!(html.contains("Decline 26.1.8"));
+        assert_eq!(html.matches("name=\"csrf\" value=\"tok\"").count(), 2);
     }
 }

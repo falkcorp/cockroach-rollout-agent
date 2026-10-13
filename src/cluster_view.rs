@@ -1,7 +1,7 @@
 // file: src/cluster_view.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: b65f6d37-171d-4be5-8fbc-306d362e20c2
-// last-edited: 2026-10-11
+// last-edited: 2026-10-12
 
 //! One read-only snapshot of everything an operator looks at. `status` prints
 //! it and the web dashboard renders it.
@@ -49,6 +49,9 @@ pub struct RolloutRow {
 /// The open rollout, reduced to what operators and prechecks need.
 #[derive(Debug, Clone)]
 pub struct OpenSummary {
+    /// Bound into forms, so an action never lands on a newer rollout than
+    /// the one the operator looked at.
+    pub id: String,
     pub kind: RolloutKind,
     pub status: RolloutStatus,
     pub from: Version,
@@ -66,6 +69,7 @@ impl OpenSummary {
 impl From<&OpenRollout> for OpenSummary {
     fn from(rollout: &OpenRollout) -> Self {
         Self {
+            id: rollout.id.clone(),
             kind: rollout.kind,
             status: rollout.status,
             from: rollout.manifest.current_version.clone(),
@@ -312,6 +316,7 @@ impl ClusterView {
 impl OpenSummary {
     pub fn sample(kind: RolloutKind, status: RolloutStatus, from: &str, to: &str) -> Self {
         Self {
+            id: format!("rollout-{from}-{to}"),
             kind,
             status,
             from: Version::parse(from).expect("literal should parse"),

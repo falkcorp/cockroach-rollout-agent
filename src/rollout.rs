@@ -1,7 +1,7 @@
 // file: src/rollout.rs
-// version: 1.3.1
+// version: 1.4.0
 // guid: ceae8795-4955-43fe-9829-2f28332e8005
-// last-edited: 2026-10-11
+// last-edited: 2026-10-12
 
 //! Pure rollout decisions, kept free of SQL and I/O so they can be unit tested.
 
@@ -15,7 +15,8 @@ use semver::Version;
 ///
 /// ```text
 /// proposed --approve--> active --all nodes on target--> finalized
-///    |                    |
+///    |  |                 |
+///    |  +--decline--> declined (never proposed again)
 ///    +-----cancel---------+--> cancelled
 ///                         +--install failed--> failed --cancel--> cancelled
 /// ```
@@ -29,6 +30,8 @@ pub enum RolloutStatus {
     /// An install failed and was rolled back. Everything halts until cancel.
     Failed,
     Cancelled,
+    /// An operator said no to this proposal; the leader skips its target.
+    Declined,
 }
 
 impl RolloutStatus {
@@ -39,6 +42,7 @@ impl RolloutStatus {
             Self::Finalized => "finalized",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Declined => "declined",
         }
     }
 }
@@ -59,6 +63,7 @@ impl FromStr for RolloutStatus {
             "finalized" => Ok(Self::Finalized),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
+            "declined" => Ok(Self::Declined),
             other => Err(format!("unknown rollout status: {other}")),
         }
     }
@@ -153,6 +158,18 @@ pub fn live_version_span(nodes: &[NodeObservation]) -> Result<(Version, Version)
             versions.len()
         )),
     }
+}
+
+/// True when an operator declined a proposal to exactly `target`. A newer
+/// patch is a different target, so it is proposed normally.
+pub fn proposal_declined(target: &Version, declined: &[Version]) -> bool {
+    declined.contains(target)
+}
+
+/// Whether a skip note differs from the last one, so a leader re-checking
+/// every tick records why once instead of flooding the event log.
+pub fn should_note(last: Option<&str>, detail: &str) -> bool {
+    last != Some(detail)
 }
 
 /// What the leader should do with the newest open rollout.
@@ -444,6 +461,7 @@ mod tests {
             RolloutStatus::Finalized,
             RolloutStatus::Failed,
             RolloutStatus::Cancelled,
+            RolloutStatus::Declined,
         ] {
             assert_eq!(status.as_str().parse::<RolloutStatus>(), Ok(status));
         }
@@ -576,5 +594,20 @@ mod tests {
             stale_after(Duration::from_secs(300)),
             Duration::from_secs(900)
         );
+    }
+
+    #[test]
+    fn a_declined_target_is_not_proposed_again_but_a_newer_patch_is() {
+        let declined = [version("26.1.8")];
+        assert!(proposal_declined(&version("26.1.8"), &declined));
+        assert!(!proposal_declined(&version("26.1.9"), &declined));
+        assert!(!proposal_declined(&version("26.1.8"), &[]));
+    }
+
+    #[test]
+    fn skip_notes_are_not_repeated() {
+        assert!(should_note(None, "declined"));
+        assert!(!should_note(Some("declined"), "declined"));
+        assert!(should_note(Some("node 3 is not live"), "declined"));
     }
 }

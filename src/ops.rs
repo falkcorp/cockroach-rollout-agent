@@ -1,7 +1,7 @@
 // file: src/ops.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 2f1695d6-80fb-4adc-9927-98f3e3b1c028
-// last-edited: 2026-10-11
+// last-edited: 2026-10-12
 
 //! Operator actions shared by the CLI and the web UI. Every precondition is
 //! checked here, so the two paths can never enforce different rules.
@@ -54,6 +54,11 @@ pub enum AvailableAction {
         warnings: Vec<String>,
         release_notes_url: String,
     },
+    /// Say no to a proposal; the leader will not propose its target again.
+    Decline {
+        rollout_id: String,
+        target: Version,
+    },
     Cancel,
     Finalize {
         target: Version,
@@ -61,7 +66,7 @@ pub enum AvailableAction {
     Restart {
         version: Version,
     },
-    /// Nothing is open, but a restart is not safe yet; shows the reason.
+    /// A restart is not possible right now; shows the reason.
     RestartBlocked {
         reason: String,
     },
@@ -87,6 +92,27 @@ pub fn approve_precheck(
             "release notes matched {:?}; review {}, then accept the release-note warnings \
              (--accept-release-note-warnings on the CLI, the checkbox in the UI)",
             open.warnings, open.release_notes_url
+        ));
+    }
+    Ok(())
+}
+
+/// `rollout_id` is the id the operator saw; the CLI passes `None` and
+/// declines whatever is proposed.
+pub fn decline_precheck(
+    open: Option<&OpenSummary>,
+    rollout_id: Option<&str>,
+) -> Result<(), String> {
+    let open = open.ok_or_else(|| "there is no proposed rollout".to_string())?;
+    if rollout_id.is_some_and(|id| id != open.id) {
+        return Err(
+            "the open rollout changed since the page loaded; reload and try again".to_string(),
+        );
+    }
+    if open.status != RolloutStatus::Proposed {
+        return Err(format!(
+            "the open rollout to {} is {}; only a proposal can be declined, use cancel",
+            open.to, open.status
         ));
     }
     Ok(())
@@ -156,6 +182,12 @@ pub fn available_actions(view: &ClusterView) -> Vec<AvailableAction> {
                 release_notes_url: open.release_notes_url.clone(),
             });
         }
+        if decline_precheck(Some(open), Some(&open.id)).is_ok() {
+            actions.push(AvailableAction::Decline {
+                rollout_id: open.id.clone(),
+                target: open.to.clone(),
+            });
+        }
         if matches!(open.status, RolloutStatus::Active | RolloutStatus::Failed) {
             actions.push(AvailableAction::Cancel);
         }
@@ -176,8 +208,7 @@ pub fn available_actions(view: &ClusterView) -> Vec<AvailableAction> {
         .collect();
     match restart_precheck(open, &view.nodes, &agents) {
         Ok(version) => actions.push(AvailableAction::Restart { version }),
-        Err(reason) if open.is_none() => actions.push(AvailableAction::RestartBlocked { reason }),
-        Err(_) => {}
+        Err(reason) => actions.push(AvailableAction::RestartBlocked { reason }),
     }
     actions
 }
@@ -251,6 +282,92 @@ pub fn approve(
         "approved {} -> {}; agents will upgrade one node at a time",
         manifest.current_version, manifest.target_version
     ))
+}
+
+pub fn decline(
+    cli: &Cli,
+    client: &mut Client,
+    actor: &Actor,
+    rollout_id: Option<&str>,
+    reason: &str,
+) -> Result<String, AppError> {
+    let open = summary_of(cli, client)?;
+    decline_precheck(open.as_ref().map(|(_, summary)| summary), rollout_id)
+        .map_err(AppError::Message)?;
+    let (rollout, _) = open.expect("the precheck passed, so a rollout is open");
+    let schema = sql_ident(&cli.schema)?;
+    let updated = client.execute(
+        &format!(
+            "UPDATE {schema}.rollouts SET status = 'declined', error = $2 \
+             WHERE id::STRING = $1 AND status = 'proposed'"
+        ),
+        &[&rollout.id, &reason],
+    )?;
+    if updated != 1 {
+        return Err(AppError::Message(
+            "the proposal changed while declining; reload status".to_string(),
+        ));
+    }
+    let target = &rollout.manifest.target_version;
+    events::note(
+        cli,
+        client,
+        actor.source(),
+        "rollout_declined",
+        &format!(
+            "current={} target={target} reason={reason} by={}",
+            rollout.manifest.current_version,
+            actor.label(cli)
+        ),
+    )?;
+    Ok(format!(
+        "declined the upgrade to {target}; it will not be proposed again \
+         (undo with: cockroach-rollout-agent undecline {target})"
+    ))
+}
+
+/// Forgets every decline of `version`, so the leader may propose it again.
+pub fn undecline(
+    cli: &Cli,
+    client: &mut Client,
+    actor: &Actor,
+    version: &str,
+) -> Result<String, AppError> {
+    let target = parse_cockroach_version(version)?;
+    let schema = sql_ident(&cli.schema)?;
+    let updated = client.execute(
+        &format!(
+            "UPDATE {schema}.rollouts SET status = 'cancelled' \
+             WHERE status = 'declined' AND target_version = $1"
+        ),
+        &[&target.to_string()],
+    )?;
+    if updated == 0 {
+        return Ok(format!("{target} was not declined"));
+    }
+    events::note(
+        cli,
+        client,
+        actor.source(),
+        "rollout_undeclined",
+        &format!("target={target} by={}", actor.label(cli)),
+    )?;
+    Ok(format!("{target} may be proposed again"))
+}
+
+/// Targets an operator declined; the leader never proposes these.
+pub fn declined_targets(cli: &Cli, client: &mut Client) -> Result<Vec<Version>, AppError> {
+    let schema = sql_ident(&cli.schema)?;
+    client
+        .query(
+            &format!(
+                "SELECT DISTINCT target_version FROM {schema}.rollouts WHERE status = 'declined'"
+            ),
+            &[],
+        )?
+        .iter()
+        .map(|row| parse_cockroach_version(row.get(0)))
+        .collect()
 }
 
 pub fn cancel(
@@ -405,6 +522,7 @@ mod tests {
             .iter()
             .map(|action| match action {
                 AvailableAction::Approve { .. } => "approve",
+                AvailableAction::Decline { .. } => "decline",
                 AvailableAction::Cancel => "cancel",
                 AvailableAction::Finalize { .. } => "finalize",
                 AvailableAction::Restart { .. } => "restart",
@@ -519,7 +637,11 @@ mod tests {
             "25.3.0",
             "25.4.17",
         );
-        assert_eq!(names(&available_actions(&with_open(proposed))), ["approve"]);
+        assert_eq!(
+            names(&available_actions(&with_open(proposed))),
+            ["approve", "decline", "restart_blocked"],
+            "a proposal can be declined, and says why it blocks a restart"
+        );
 
         let midway = OpenSummary::sample(
             RolloutKind::Upgrade,
@@ -529,11 +651,14 @@ mod tests {
         );
         let mut view = with_open(midway.clone());
         view.nodes[0].version = Some(v("25.3.0"));
-        assert_eq!(names(&available_actions(&view)), ["cancel"]);
+        assert_eq!(
+            names(&available_actions(&view)),
+            ["cancel", "restart_blocked"]
+        );
 
         assert_eq!(
             names(&available_actions(&with_open(midway))),
-            ["cancel", "finalize"],
+            ["cancel", "finalize", "restart_blocked"],
             "major line, every node on target: the leader awaits the operator"
         );
 
@@ -545,7 +670,7 @@ mod tests {
         );
         assert_eq!(
             names(&available_actions(&with_open(patch))),
-            ["cancel"],
+            ["cancel", "restart_blocked"],
             "a patch rollout finalizes itself"
         );
 
@@ -555,7 +680,10 @@ mod tests {
             "25.3.0",
             "25.4.17",
         );
-        assert_eq!(names(&available_actions(&with_open(failed))), ["cancel"]);
+        assert_eq!(
+            names(&available_actions(&with_open(failed))),
+            ["cancel", "restart_blocked"]
+        );
 
         let restarting = OpenSummary::sample(
             RolloutKind::Restart,
@@ -565,7 +693,7 @@ mod tests {
         );
         assert_eq!(
             names(&available_actions(&with_open(restarting))),
-            ["cancel"]
+            ["cancel", "restart_blocked"]
         );
 
         assert_eq!(
@@ -587,7 +715,10 @@ mod tests {
             "25.3.0",
             "25.4.17",
         );
-        assert_eq!(names(&available_actions(&with_open(offered))), ["approve"]);
+        assert_eq!(
+            names(&available_actions(&with_open(offered))),
+            ["approve", "decline", "restart_blocked"]
+        );
         // ...but someone approved it from the CLI before this POST arrived.
         let now = OpenSummary::sample(
             RolloutKind::Upgrade,
@@ -610,5 +741,29 @@ mod tests {
             "25.4.18",
         );
         assert!(restart_precheck(Some(&appeared), &view.nodes, &agents).is_err());
+    }
+
+    #[test]
+    fn decline_needs_a_proposed_rollout_with_the_same_id() {
+        let proposed = OpenSummary::sample(
+            RolloutKind::Upgrade,
+            RolloutStatus::Proposed,
+            "25.4.17",
+            "26.1.8",
+        );
+        assert!(decline_precheck(Some(&proposed), Some(&proposed.id)).is_ok());
+        assert!(
+            decline_precheck(Some(&proposed), None).is_ok(),
+            "the CLI declines whatever is proposed"
+        );
+        let other = decline_precheck(Some(&proposed), Some("someone-else")).unwrap_err();
+        assert!(other.contains("changed"), "{other}");
+        assert!(decline_precheck(None, None).is_err());
+        let active = OpenSummary {
+            status: RolloutStatus::Active,
+            ..proposed
+        };
+        let refused = decline_precheck(Some(&active), Some(&active.id)).unwrap_err();
+        assert!(refused.contains("cancel"), "{refused}");
     }
 }
