@@ -54,6 +54,9 @@ pub enum AvailableAction {
         version: Version,
         warnings: Vec<String>,
         release_notes_url: String,
+        /// Must be acknowledged, like release-note warnings.
+        settings_warnings: Vec<String>,
+        settings_info: Vec<String>,
     },
     /// Say no to a proposal; the leader will not propose its target again.
     Decline {
@@ -93,6 +96,13 @@ pub fn approve_precheck(
             "release notes matched {:?}; review {}, then accept the release-note warnings \
              (--accept-release-note-warnings on the CLI, the checkbox in the UI)",
             open.warnings, open.release_notes_url
+        ));
+    }
+    if !open.settings_warnings.is_empty() && !accept_warnings {
+        return Err(format!(
+            "the upgrade touches overridden cluster settings: {}; review them, then accept \
+             the warnings (--accept-release-note-warnings on the CLI, the checkbox in the UI)",
+            open.settings_warnings.join("; ")
         ));
     }
     Ok(())
@@ -181,6 +191,8 @@ pub fn available_actions(view: &ClusterView) -> Vec<AvailableAction> {
                 version: open.to.clone(),
                 warnings: open.warnings.clone(),
                 release_notes_url: open.release_notes_url.clone(),
+                settings_warnings: open.settings_warnings.clone(),
+                settings_info: open.settings_info.clone(),
             });
         }
         if decline_precheck(Some(open), Some(&open.id)).is_ok() {
@@ -489,6 +501,7 @@ pub fn restart_cluster(cli: &Cli, client: &mut Client, actor: &Actor) -> Result<
         release_note_warnings: Vec::new(),
         release_note_warnings_approved: true,
         artifacts: Vec::new(),
+        settings_report: None,
     };
     let schema = sql_ident(&cli.schema)?;
     let by = actor.label(cli);
@@ -784,5 +797,21 @@ mod tests {
         };
         let refused = decline_precheck(Some(&active), Some(&active.id)).unwrap_err();
         assert!(refused.contains("cancel"), "{refused}");
+    }
+
+    #[test]
+    fn approve_requires_ack_for_settings_warnings() {
+        let proposed = OpenSummary {
+            settings_warnings: vec!["kv.x default changes from 1 to 2".to_string()],
+            ..OpenSummary::sample(
+                RolloutKind::Upgrade,
+                RolloutStatus::Proposed,
+                "25.4.17",
+                "26.1.8",
+            )
+        };
+        let refused = approve_precheck(Some(&proposed), &v("26.1.8"), false).unwrap_err();
+        assert!(refused.contains("kv.x"), "{refused}");
+        assert!(approve_precheck(Some(&proposed), &v("26.1.8"), true).is_ok());
     }
 }

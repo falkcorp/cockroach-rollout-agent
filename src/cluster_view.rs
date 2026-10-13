@@ -63,6 +63,8 @@ pub struct OpenSummary {
     pub to: Version,
     pub warnings: Vec<String>,
     pub release_notes_url: String,
+    pub settings_warnings: Vec<String>,
+    pub settings_info: Vec<String>,
 }
 
 impl OpenSummary {
@@ -81,6 +83,18 @@ impl From<&OpenRollout> for OpenSummary {
             to: rollout.manifest.target_version.clone(),
             warnings: rollout.manifest.release_note_warnings.clone(),
             release_notes_url: rollout.manifest.release_notes_url.clone(),
+            settings_warnings: rollout
+                .manifest
+                .settings_report
+                .as_ref()
+                .map(|report| report.warning_lines())
+                .unwrap_or_default(),
+            settings_info: rollout
+                .manifest
+                .settings_report
+                .as_ref()
+                .map(|report| report.info_lines())
+                .unwrap_or_default(),
         }
     }
 }
@@ -359,6 +373,8 @@ impl OpenSummary {
             to: Version::parse(to).expect("literal should parse"),
             warnings: Vec::new(),
             release_notes_url: "https://www.cockroachlabs.com/docs/releases/v25.4".to_string(),
+            settings_warnings: Vec::new(),
+            settings_info: Vec::new(),
         }
     }
 }
@@ -400,12 +416,17 @@ mod tests {
                 release_note_warnings: vec!["removed".to_string()],
                 release_note_warnings_approved: true,
                 artifacts: Vec::new(),
+                settings_report: Some(crate::settings::SettingsReport::failed("no binary")),
             },
         };
         let summary = OpenSummary::from(&rollout);
         assert_eq!(summary.kind, RolloutKind::Restart);
         assert_eq!(summary.to, Version::new(25, 4, 17));
         assert_eq!(summary.warnings, vec!["removed".to_string()]);
+        assert_eq!(
+            summary.settings_warnings,
+            vec!["settings diff unavailable: no binary".to_string()]
+        );
     }
 
     #[test]
