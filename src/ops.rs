@@ -11,6 +11,7 @@ use semver::Version;
 
 use crate::cluster_view::{self, ClusterView, OpenSummary};
 use crate::events::{self, Source};
+use crate::releases;
 use crate::rollout::{
     AgentObservation, MIN_RESTART_AGENT_VERSION, NodeObservation, RolloutKind, RolloutStatus,
     all_nodes_on, live_version_span, restart_agent_gaps,
@@ -368,6 +369,24 @@ pub fn declined_targets(cli: &Cli, client: &mut Client) -> Result<Vec<Version>, 
         .iter()
         .map(|row| parse_cockroach_version(row.get(0)))
         .collect()
+}
+
+/// Asks the leader to fetch the release list on its next tick.
+pub fn check_releases(cli: &Cli, client: &mut Client, actor: &Actor) -> Result<String, AppError> {
+    releases::request_refresh(cli, client)?;
+    events::note(
+        cli,
+        client,
+        actor.source(),
+        "releases_check_requested",
+        &format!("by={}", actor.label(cli)),
+    )?;
+    Ok(format!(
+        "the leader will check for new releases within {} minutes \
+         (at most once every {} minutes)",
+        crate::DEFAULT_DAEMON_INTERVAL_SECONDS / 60,
+        releases::CATALOG_MIN_REFRESH_SECS / 60
+    ))
 }
 
 pub fn cancel(

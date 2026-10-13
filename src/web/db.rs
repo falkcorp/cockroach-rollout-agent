@@ -134,6 +134,7 @@ impl Backend for DbBackend {
                 ops::finalize(cli, &mut client, actor, &confirm_version, false)
             }
             WebAction::Restart => ops::restart_cluster(cli, &mut client, actor),
+            WebAction::CheckReleases => ops::check_releases(cli, &mut client, actor),
         }
         .map_err(text)
     }
